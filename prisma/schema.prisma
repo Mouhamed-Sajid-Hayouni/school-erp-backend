@@ -1,0 +1,126 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum Role {
+  ADMIN
+  TEACHER
+  STUDENT
+  PARENT
+}
+
+model User {
+  id            String   @id @default(uuid())
+  email         String   @unique
+  passwordHash  String
+  firstName     String
+  lastName      String
+  phone         String?
+  role          Role     @default(STUDENT)
+  isActive      Boolean  @default(true)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  studentProfile Student?
+  teacherProfile Teacher?
+  parentProfile  Parent?
+}
+
+model Student {
+  id             String   @id @default(uuid())
+  userId         String   @unique
+  user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  dateOfBirth    DateTime
+  enrollmentDate DateTime @default(now())
+  classId        String?
+  class          Class?   @relation(fields: [classId], references: [id])
+  parentId       String?
+  parent         Parent?  @relation(fields: [parentId], references: [id])
+  
+  attendances    Attendance[]
+  grades         Grade[]      // NEW: Linked to Grades!
+}
+
+model Teacher {
+  id         String   @id @default(uuid())
+  userId     String   @unique
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  specialty  String   
+  hireDate   DateTime @default(now())
+
+  schedules  Schedule[]
+}
+
+model Parent {
+  id       String    @id @default(uuid())
+  userId   String    @unique
+  user     User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  address  String?
+  
+  children Student[]
+}
+
+model Class {
+  id           String    @id @default(uuid())
+  name         String    
+  academicYear String    
+  
+  students     Student[]
+  schedules    Schedule[]
+}
+
+model Subject {
+  id          String     @id @default(uuid())
+  name        String     
+  coefficient Float      @default(1.0)
+  
+  schedules   Schedule[]
+  grades      Grade[]      // NEW: Linked to Grades!
+}
+
+model Schedule {
+  id         String   @id @default(uuid())
+  classId    String
+  class      Class    @relation(fields: [classId], references: [id], onDelete: Cascade)
+  subjectId  String
+  subject    Subject  @relation(fields:[subjectId], references: [id], onDelete: Cascade)
+  teacherId  String
+  teacher    Teacher  @relation(fields: [teacherId], references: [id], onDelete: Cascade)
+  
+  dayOfWeek  String   
+  startTime  String   
+  endTime    String   
+
+  attendances Attendance[]
+}
+
+model Attendance {
+  id         String   @id @default(uuid())
+  studentId  String
+  student    Student  @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  scheduleId String
+  schedule   Schedule @relation(fields: [scheduleId], references: [id], onDelete: Cascade)
+  
+  date       DateTime @default(now())
+  status     String   
+  remarks    String?
+}
+
+// --- NEW MAGIC: THE GRADES TABLE ---
+model Grade {
+  id          String   @id @default(uuid())
+  studentId   String
+  student     Student  @relation(fields:[studentId], references: [id], onDelete: Cascade)
+  subjectId   String
+  subject     Subject  @relation(fields: [subjectId], references: [id], onDelete: Cascade)
+  
+  examType    String   // e.g., "Devoir de Contrôle N°1", "Devoir de Synthèse"
+  score       Float    // e.g., 15.5 or 20
+  comments    String?  // e.g., "Excellent travail!"
+  
+  createdAt   DateTime @default(now())
+}
