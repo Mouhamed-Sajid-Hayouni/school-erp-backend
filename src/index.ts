@@ -39,7 +39,7 @@ app.post('/api/login', async (req: Request, res: Response): Promise<any> => {
     const isPasswordValid = await bcrypt.compare(password, user.passwordHash);
     if (!isPasswordValid) return res.status(401).json({ error: "Invalid password!" });
     const token = jwt.sign({ userId: user.id, role: user.role, firstName: user.firstName }, JWT_SECRET, { expiresIn: '1d' });
-    res.json({ message: "Login successful!", token, role: user.role, firstName: user.firstName });
+    res.json({ message: "Login successful!", token, role: user.role, firstName: user.firstName, lastName: user.lastName });
   } catch (error) { res.status(500).json({ error: "Login failed" }); }
 });
 
@@ -99,9 +99,101 @@ app.get('/api/subjects', authenticateToken, async (req: Request, res: Response) 
 app.post('/api/subjects', authenticateToken, async (req: Request, res: Response): Promise<any> => { try { res.status(201).json(await prisma.subject.create({ data: { name: req.body.name, coefficient: parseFloat(req.body.coefficient) } })); } catch (error) { res.status(500).json({ error: "Failed" }); } });
 app.delete('/api/subjects/:id', authenticateToken, async (req: Request, res: Response): Promise<any> => { try { await prisma.subject.delete({ where: { id: req.params.id as string } }); res.json({ message: "Deleted!" }); } catch (error) { res.status(500).json({ error: "Failed" }); } });
 app.get('/api/teachers', authenticateToken, async (req: Request, res: Response) => { try { res.json(await prisma.teacher.findMany({ include: { user: true } })); } catch (error) { res.status(500).json({ error: "Failed" }); } });
-app.get('/api/schedules', authenticateToken, async (req: Request, res: Response) => { try { res.json(await prisma.schedule.findMany({ include: { class: { include: { students: { include: { user: true } } } }, subject: true, teacher: { include: { user: true } } }, orderBy: { dayOfWeek: 'asc' } })); } catch (error) { res.status(500).json({ error: "Failed" }); } });
-app.post('/api/schedules', authenticateToken, async (req: Request, res: Response): Promise<any> => { try { res.status(201).json(await prisma.schedule.create({ data: { classId: req.body.classId, subjectId: req.body.subjectId, teacherId: req.body.teacherId, dayOfWeek: req.body.dayOfWeek, startTime: req.body.startTime, endTime: req.body.endTime } })); } catch (error) { res.status(500).json({ error: "Failed" }); } });
-app.delete('/api/schedules/:id', authenticateToken, async (req: Request, res: Response): Promise<any> => { try { await prisma.schedule.delete({ where: { id: req.params.id as string } }); res.json({ message: "Deleted!" }); } catch (error) { res.status(500).json({ error: "Failed" }); } });
+app.get('/api/schedules', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    res.json(
+      await prisma.schedule.findMany({
+        include: {
+          class: { include: { students: { include: { user: true } } } },
+          subject: true,
+          teacher: { include: { user: true } }
+        },
+        orderBy: { dayOfWeek: 'asc' }
+      })
+    );
+  } catch (error) {
+    res.status(500).json({ error: "Failed" });
+  }
+});
+
+app.post('/api/schedules', authenticateToken, async (req: Request, res: Response): Promise<any> => {
+  try {
+    const { classId, subjectId, teacherId, dayOfWeek, startTime, endTime } = req.body;
+
+    if (!classId || !subjectId || !teacherId || !dayOfWeek || !startTime || !endTime) {
+      return res.status(400).json({ error: "All fields are required!" });
+    }
+
+    const createdSchedule = await prisma.schedule.create({
+      data: {
+        classId,
+        subjectId,
+        teacherId,
+        dayOfWeek,
+        startTime,
+        endTime
+      },
+      include: {
+        class: true,
+        subject: true,
+        teacher: { include: { user: true } }
+      }
+    });
+
+    res.status(201).json(createdSchedule);
+  } catch (error) {
+    res.status(500).json({ error: "Failed" });
+  }
+});
+
+app.put('/api/schedules/:id', authenticateToken, async (req: Request, res: Response): Promise<any> => {
+  try {
+    const scheduleId = req.params.id as string;
+    const { classId, subjectId, teacherId, dayOfWeek, startTime, endTime } = req.body;
+
+    if (!classId || !subjectId || !teacherId || !dayOfWeek || !startTime || !endTime) {
+      return res.status(400).json({ error: "All fields are required!" });
+    }
+
+    const existingSchedule = await prisma.schedule.findUnique({
+      where: { id: scheduleId }
+    });
+
+    if (!existingSchedule) {
+      return res.status(404).json({ error: "Schedule not found!" });
+    }
+
+    const updatedSchedule = await prisma.schedule.update({
+      where: { id: scheduleId },
+      data: {
+        classId,
+        subjectId,
+        teacherId,
+        dayOfWeek,
+        startTime,
+        endTime
+      },
+      include: {
+        class: true,
+        subject: true,
+        teacher: { include: { user: true } }
+      }
+    });
+
+    res.json(updatedSchedule);
+  } catch (error) {
+    res.status(500).json({ error: "Failed to update schedule" });
+  }
+});
+
+app.delete('/api/schedules/:id', authenticateToken, async (req: Request, res: Response): Promise<any> => {
+  try {
+    await prisma.schedule.delete({ where: { id: req.params.id as string } });
+    res.json({ message: "Deleted!" });
+  } catch (error) {
+    res.status(500).json({ error: "Failed" });
+  }
+});
 app.get('/api/attendance/:scheduleId', authenticateToken, async (req: Request, res: Response): Promise<any> => { try { const scheduleId = req.params.scheduleId as string; const targetDate = new Date(req.query.date as string); const startDate = new Date(targetDate); startDate.setHours(0,0,0,0); const endDate = new Date(targetDate); endDate.setHours(23,59,59,999); res.json(await prisma.attendance.findMany({ where: { scheduleId: scheduleId, date: { gte: startDate, lte: endDate } } })); } catch (error) { res.status(500).json({ error: "Failed" }); } });
 app.post('/api/attendance', authenticateToken, async (req: Request, res: Response): Promise<any> => { try { const { studentId, scheduleId, status, date } = req.body; const targetDate = new Date(date); const startDate = new Date(targetDate); startDate.setHours(0,0,0,0); const endDate = new Date(targetDate); endDate.setHours(23,59,59,999); const existing = await prisma.attendance.findFirst({ where: { studentId, scheduleId, date: { gte: startDate, lte: endDate } } }); if (existing) await prisma.attendance.update({ where: { id: existing.id }, data: { status } }); else await prisma.attendance.create({ data: { studentId, scheduleId, status, date: targetDate } }); res.json({ message: "Attendance saved!" }); } catch (error) { res.status(500).json({ error: "Failed" }); } });
 app.get('/api/grades/:classId/:subjectId', authenticateToken, async (req: Request, res: Response): Promise<any> => { try { res.json(await prisma.student.findMany({ where: { classId: req.params.classId as string }, include: { user: true, grades: { where: { subjectId: req.params.subjectId as string } } } })); } catch (error) { res.status(500).json({ error: "Failed" }); } });
