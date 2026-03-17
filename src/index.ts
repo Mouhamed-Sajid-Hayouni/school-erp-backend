@@ -5,15 +5,26 @@ import { Pool } from 'pg';
 import { PrismaPg } from '@prisma/adapter-pg';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
+import 'dotenv/config';
 
-const connectionString = "postgresql://neondb_owner:npg_4Uyb6jqaunRS@ep-orange-shape-alrgercn.c-3.eu-central-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require";
+const connectionString = process.env.DATABASE_URL;
+const JWT_SECRET = process.env.JWT_SECRET;
+const PORT = Number(process.env.PORT || 5000);
+
+if (!connectionString) {
+  throw new Error("DATABASE_URL is missing");
+}
+
+if (!JWT_SECRET) {
+  throw new Error("JWT_SECRET is missing");
+}
+
 const pool = new Pool({ connectionString });
 const adapter = new PrismaPg(pool);
 const prisma = new PrismaClient({ adapter });
 
 const app = express();
-const PORT = 5000;
-const JWT_SECRET = "super_secret_school_key_123";
+
 
 app.use(cors());
 app.use(express.json());
