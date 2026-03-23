@@ -237,7 +237,16 @@ app.get('/api/my-portal', authenticateToken, async (req: Request, res: Response)
           children: {
             include: {
               user: true,
-              class: { include: { schedules: { include: { subject: true } } } },
+              class: {
+                include: {
+                  schedules: {
+                    include: {
+                      subject: true,
+                      teacher: { include: { user: true } }
+                    }
+                  }
+                }
+              },
               grades: { include: { subject: true }, orderBy: { createdAt: 'desc' } },
               attendances: { include: { schedule: { include: { subject: true } } }, orderBy: { date: 'desc' } }
             }
