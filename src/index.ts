@@ -1,6 +1,6 @@
 import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
-import { PrismaClient } from '@prisma/client';
+import { PrismaClient, GradePeriod } from '@prisma/client';
 import { Pool } from 'pg';
 import { PrismaPg } from '@prisma/adapter-pg';
 import bcrypt from 'bcryptjs';
@@ -24,6 +24,12 @@ const adapter = new PrismaPg(pool);
 const prisma = new PrismaClient({ adapter });
 
 const app = express();
+
+const parseGradePeriod = (value?: string): GradePeriod => {
+  if (value === 'TRIMESTER_2') return 'TRIMESTER_2';
+  if (value === 'TRIMESTER_3') return 'TRIMESTER_3';
+  return 'TRIMESTER_1';
+};
 
 
 app.use(cors());
@@ -207,8 +213,83 @@ app.delete('/api/schedules/:id', authenticateToken, async (req: Request, res: Re
 });
 app.get('/api/attendance/:scheduleId', authenticateToken, async (req: Request, res: Response): Promise<any> => { try { const scheduleId = req.params.scheduleId as string; const targetDate = new Date(req.query.date as string); const startDate = new Date(targetDate); startDate.setHours(0,0,0,0); const endDate = new Date(targetDate); endDate.setHours(23,59,59,999); res.json(await prisma.attendance.findMany({ where: { scheduleId: scheduleId, date: { gte: startDate, lte: endDate } } })); } catch (error) { res.status(500).json({ error: "Failed" }); } });
 app.post('/api/attendance', authenticateToken, async (req: Request, res: Response): Promise<any> => { try { const { studentId, scheduleId, status, date } = req.body; const targetDate = new Date(date); const startDate = new Date(targetDate); startDate.setHours(0,0,0,0); const endDate = new Date(targetDate); endDate.setHours(23,59,59,999); const existing = await prisma.attendance.findFirst({ where: { studentId, scheduleId, date: { gte: startDate, lte: endDate } } }); if (existing) await prisma.attendance.update({ where: { id: existing.id }, data: { status } }); else await prisma.attendance.create({ data: { studentId, scheduleId, status, date: targetDate } }); res.json({ message: "Attendance saved!" }); } catch (error) { res.status(500).json({ error: "Failed" }); } });
-app.get('/api/grades/:classId/:subjectId', authenticateToken, async (req: Request, res: Response): Promise<any> => { try { res.json(await prisma.student.findMany({ where: { classId: req.params.classId as string }, include: { user: true, grades: { where: { subjectId: req.params.subjectId as string } } } })); } catch (error) { res.status(500).json({ error: "Failed" }); } });
-app.post('/api/grades', authenticateToken, async (req: Request, res: Response): Promise<any> => { try { const { studentId, subjectId, examType, score, comments } = req.body; const existing = await prisma.grade.findFirst({ where: { studentId, subjectId, examType } }); if (existing) { await prisma.grade.update({ where: { id: existing.id }, data: { score: parseFloat(score), comments } }); } else { await prisma.grade.create({ data: { studentId, subjectId, examType, score: parseFloat(score), comments } }); } res.json({ message: "Grade saved!" }); } catch (error) { res.status(500).json({ error: "Failed" }); } });
+app.get('/api/grades/:classId/:subjectId', authenticateToken, async (req: Request, res: Response): Promise<any> => {
+  try {
+    const classId = req.params.classId as string;
+    const subjectId = req.params.subjectId as string;
+    const period = parseGradePeriod(req.query.period as string | undefined);
+
+    const students = await prisma.student.findMany({
+      where: { classId },
+      include: {
+        user: true,
+        grades: {
+          where: {
+            subjectId,
+            period,
+          },
+        },
+      },
+    });
+
+    res.json(students);
+  } catch (error) {
+  console.error('GET /api/grades error:', error);
+  res.status(500).json({ error: "Failed" });
+}
+});
+app.post('/api/grades', authenticateToken, async (req: Request, res: Response): Promise<any> => {
+  try {
+    const { studentId, subjectId, examType, period, score, comments } = req.body;
+
+    if (!studentId || !subjectId || !examType || score === undefined || score === null) {
+      return res.status(400).json({ error: "studentId, subjectId, examType, and score are required!" });
+    }
+
+    const gradePeriod = parseGradePeriod(period);
+    const numericScore = parseFloat(score);
+
+    if (Number.isNaN(numericScore)) {
+      return res.status(400).json({ error: "Score must be a valid number!" });
+    }
+
+    const existing = await prisma.grade.findFirst({
+      where: {
+        studentId,
+        subjectId,
+        examType,
+        period: gradePeriod,
+      },
+    });
+
+    if (existing) {
+      await prisma.grade.update({
+        where: { id: existing.id },
+        data: {
+          score: numericScore,
+          comments,
+          period: gradePeriod,
+        },
+      });
+    } else {
+      await prisma.grade.create({
+        data: {
+          studentId,
+          subjectId,
+          examType,
+          period: gradePeriod,
+          score: numericScore,
+          comments,
+        },
+      });
+    }
+
+    res.json({ message: "Grade saved!" });
+  } catch (error) {
+  console.error('POST /api/grades error:', error);
+  res.status(500).json({ error: "Failed" });
+}
+});
 
 // --- NEW MAGIC: THE STUDENT/PARENT PORTAL ---
 app.get('/api/my-portal', authenticateToken, async (req: Request, res: Response): Promise<any> => {
