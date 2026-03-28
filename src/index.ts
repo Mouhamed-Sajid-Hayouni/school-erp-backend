@@ -398,6 +398,124 @@ app.get('/api/student-summary/:studentId', authenticateToken, async (req: Reques
   }
 });
 
+app.get('/api/student-bulletin/:studentId', authenticateToken, async (req: Request, res: Response): Promise<any> => {
+  try {
+    const studentId = req.params.studentId as string;
+    const period = parseGradePeriod(req.query.period as string | undefined);
+
+    const student = await prisma.student.findUnique({
+      where: { id: studentId },
+      include: {
+        user: true,
+        class: true,
+        grades: {
+          where: { period },
+          include: { subject: true },
+          orderBy: { createdAt: 'desc' },
+        },
+        attendances: {
+          include: {
+            schedule: { include: { subject: true } },
+          },
+          orderBy: { date: 'desc' },
+        },
+      },
+    });
+
+    if (!student) {
+      return res.status(404).json({ error: 'Student not found!' });
+    }
+
+    const gradeGroups = new Map<
+      string,
+      {
+        subjectId: string;
+        subjectName: string;
+        coefficient: number;
+        scores: number[];
+      }
+    >();
+
+    for (const grade of student.grades) {
+      const subjectId = grade.subjectId;
+      const subjectName = grade.subject?.name ?? 'Unknown Subject';
+      const coefficient = grade.subject?.coefficient ?? 1;
+
+      const existing = gradeGroups.get(subjectId);
+
+      if (existing) {
+        existing.scores.push(grade.score);
+      } else {
+        gradeGroups.set(subjectId, {
+          subjectId,
+          subjectName,
+          coefficient,
+          scores: [grade.score],
+        });
+      }
+    }
+
+    const subjectSummaries = [...gradeGroups.values()].map((item) => {
+      const average =
+        item.scores.reduce((sum, value) => sum + value, 0) / item.scores.length;
+
+      return {
+        subjectId: item.subjectId,
+        subjectName: item.subjectName,
+        coefficient: item.coefficient,
+        gradesCount: item.scores.length,
+        average,
+      };
+    });
+
+    const weightedSum = subjectSummaries.reduce(
+      (sum, item) => sum + item.average * item.coefficient,
+      0
+    );
+
+    const coefficientSum = subjectSummaries.reduce(
+      (sum, item) => sum + item.coefficient,
+      0
+    );
+
+    const generalAverage =
+      coefficientSum > 0 ? weightedSum / coefficientSum : null;
+
+    const allScores = student.grades.map((grade) => grade.score);
+    const bestScore = allScores.length > 0 ? Math.max(...allScores) : null;
+
+    const absencesCount = student.attendances.filter(
+      (attendance) => attendance.status === 'ABSENT'
+    ).length;
+
+    res.json({
+      student: {
+        id: student.id,
+        firstName: student.user?.firstName ?? '',
+        lastName: student.user?.lastName ?? '',
+        email: student.user?.email ?? '',
+      },
+      class: student.class
+        ? {
+            id: student.class.id,
+            name: student.class.name,
+            academicYear: student.class.academicYear,
+          }
+        : null,
+      period,
+      gradesCount: student.grades.length,
+      bestScore,
+      generalAverage,
+      coefficientSum,
+      absencesCount,
+      subjects: subjectSummaries.sort((a, b) => b.average - a.average),
+    });
+  } catch (error) {
+    console.error('GET /api/student-bulletin/:studentId error:', error);
+    res.status(500).json({ error: 'Failed to compute bulletin' });
+  }
+});
+
 // --- NEW MAGIC: THE STUDENT/PARENT PORTAL ---
 app.get('/api/my-portal', authenticateToken, async (req: Request, res: Response): Promise<any> => {
   try {
