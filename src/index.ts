@@ -1,6 +1,6 @@
 import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
-import { PrismaClient, GradePeriod } from '@prisma/client';
+import { PrismaClient, GradePeriod, AnnouncementAudience, Role } from '@prisma/client';
 import { Pool } from 'pg';
 import { PrismaPg } from '@prisma/adapter-pg';
 import bcrypt from 'bcryptjs';
@@ -19,7 +19,12 @@ if (!JWT_SECRET) {
   throw new Error("JWT_SECRET is missing");
 }
 
-const pool = new Pool({ connectionString });
+const pool = new Pool({
+  connectionString,
+  max: 10,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 10000,
+});
 const adapter = new PrismaPg(pool);
 const prisma = new PrismaClient({ adapter });
 
@@ -46,52 +51,674 @@ const authenticateToken = (req: Request, res: Response, next: NextFunction): any
   });
 };
 
+const requireAdmin = (req: Request, res: Response, next: NextFunction): any => {
+  const role = (req as any).user?.role;
+
+  if (role !== 'ADMIN') {
+    return res.status(403).json({ error: 'Only admins can access this resource.' });
+  }
+
+  next();
+};
+
+const isAdminOrTeacher = (req: Request) => {
+  const role = (req as any).user?.role;
+  return role === 'ADMIN' || role === 'TEACHER';
+};
+
+const getTeacherProfileId = async (userId: string) => {
+  const teacher = await prisma.teacher.findUnique({
+    where: { userId },
+    select: { id: true },
+  });
+
+  return teacher?.id ?? null;
+};
+
+const getTeacherClassIds = async (teacherId: string) => {
+  const schedules = await prisma.schedule.findMany({
+    where: { teacherId },
+    select: { classId: true },
+  });
+
+  return uniqueStringValues(schedules.map((schedule) => schedule.classId));
+};
+
+const teacherHasClassSubjectScope = async (
+  teacherId: string,
+  classId: string,
+  subjectId: string
+) => {
+  const schedule = await prisma.schedule.findFirst({
+    where: {
+      teacherId,
+      classId,
+      subjectId,
+    },
+    select: { id: true },
+  });
+
+  return Boolean(schedule);
+};
+
+const teacherHasStudentScope = async (teacherId: string, studentId: string) => {
+  const student = await prisma.student.findUnique({
+    where: { id: studentId },
+    select: {
+      id: true,
+      classId: true,
+    },
+  });
+
+  if (!student?.classId) {
+    return { allowed: false, student: null };
+  }
+
+  const teacherClassIds = await getTeacherClassIds(teacherId);
+
+  return {
+    allowed: teacherClassIds.includes(student.classId),
+    student,
+  };
+};
+
+const timeRangesOverlap = (
+  startA: string,
+  endA: string,
+  startB: string,
+  endB: string
+) => {
+  return startA < endB && startB < endA;
+};
+
+const findScheduleConflicts = async ({
+  classId,
+  teacherId,
+  dayOfWeek,
+  startTime,
+  endTime,
+  excludeScheduleId,
+}: {
+  classId: string;
+  teacherId: string;
+  dayOfWeek: string;
+  startTime: string;
+  endTime: string;
+  excludeScheduleId?: string;
+}) => {
+  const candidates = await prisma.schedule.findMany({
+    where: {
+      dayOfWeek,
+      ...(excludeScheduleId ? { id: { not: excludeScheduleId } } : {}),
+      OR: [{ classId }, { teacherId }],
+    },
+    select: {
+      id: true,
+      classId: true,
+      teacherId: true,
+      startTime: true,
+      endTime: true,
+    },
+  });
+
+  const conflicts = candidates.filter((schedule) =>
+    timeRangesOverlap(startTime, endTime, schedule.startTime, schedule.endTime)
+  );
+
+  return {
+    classConflict: conflicts.find((schedule) => schedule.classId === classId) ?? null,
+    teacherConflict: conflicts.find((schedule) => schedule.teacherId === teacherId) ?? null,
+  };
+};
+
+const isValidTimeValue = (value: unknown) => {
+  if (typeof value !== 'string') return false;
+
+  const normalized = value.trim();
+  return /^([01]\d|2[0-3]):([0-5]\d)$/.test(normalized);
+};
+
+const parseAssignmentStatus = (value?: string) => {
+  const normalized = (value || 'PENDING').toUpperCase();
+  return normalized === 'DONE' ? 'DONE' : 'PENDING';
+};
+
+const parseAttendanceStatus = (value?: string) => {
+  const normalized = String(value ?? '').trim().toUpperCase();
+
+  if (normalized === 'ABSENT') return 'ABSENT';
+  if (normalized === 'LATE') return 'LATE';
+  if (normalized === 'PRESENT') return 'PRESENT';
+
+  return null;
+};
+
+const parseAnnouncementAudience = (value?: string): AnnouncementAudience => {
+  if (value === 'STUDENTS') return 'STUDENTS';
+  if (value === 'PARENTS') return 'PARENTS';
+  if (value === 'TEACHERS') return 'TEACHERS';
+  if (value === 'CLASS') return 'CLASS';
+  return 'ALL';
+};
+
+const getAllowedAnnouncementAudiences = (
+  role: string
+): AnnouncementAudience[] => {
+  if (role === "ADMIN") {
+    return [
+      AnnouncementAudience.ALL,
+      AnnouncementAudience.STUDENTS,
+      AnnouncementAudience.PARENTS,
+      AnnouncementAudience.TEACHERS,
+      AnnouncementAudience.CLASS,
+    ];
+  }
+
+  if (role === "TEACHER") {
+    return [
+      AnnouncementAudience.TEACHERS,
+      AnnouncementAudience.CLASS,
+    ];
+  }
+
+  return [];
+};
+
+const createNotificationsForUserIds = async (
+  userIds: string[],
+  title: string,
+  message: string,
+  type: string,
+  relatedId?: string | null
+) => {
+  const uniqueUserIds = [...new Set(userIds.filter(Boolean))];
+
+  if (uniqueUserIds.length === 0) return;
+
+  await prisma.notification.createMany({
+    data: uniqueUserIds.map((userId) => ({
+      userId,
+      title,
+      message,
+      type,
+      relatedId: relatedId || null,
+    })),
+  });
+};
+
+const publicUserSelect = {
+  id: true,
+  firstName: true,
+  lastName: true,
+  email: true,
+  role: true,
+} as const;
+
+const messageUserSelect = publicUserSelect;
+
+const uniqueStringValues = (values: Array<string | null | undefined>) => {
+  return [...new Set(values.filter(Boolean) as string[])];
+};
+
+const getAllowedMessageRecipients = async (userId: string, role: string) => {
+  if (role === Role.ADMIN) {
+    return prisma.user.findMany({
+      where: {
+        isActive: true,
+        id: { not: userId },
+      },
+      select: messageUserSelect,
+      orderBy: [
+        { role: 'asc' },
+        { firstName: 'asc' },
+        { lastName: 'asc' },
+      ],
+    });
+  }
+
+  if (role === Role.TEACHER) {
+    const teacher = await prisma.teacher.findUnique({
+      where: { userId },
+      include: {
+        schedules: {
+          select: {
+            classId: true,
+          },
+        },
+      },
+    });
+
+    const classIds = uniqueStringValues(
+      (teacher?.schedules ?? []).map((schedule) => schedule.classId)
+    );
+
+    return prisma.user.findMany({
+      where: {
+        isActive: true,
+        id: { not: userId },
+        OR: [
+          { role: Role.ADMIN },
+          { role: Role.TEACHER },
+          ...(classIds.length > 0
+            ? [
+                {
+                  studentProfile: {
+                    is: {
+                      classId: {
+                        in: classIds,
+                      },
+                    },
+                  },
+                },
+                {
+                  parentProfile: {
+                    is: {
+                      children: {
+                        some: {
+                          classId: {
+                            in: classIds,
+                          },
+                        },
+                      },
+                    },
+                  },
+                },
+              ]
+            : []),
+        ],
+      },
+      select: messageUserSelect,
+      orderBy: [
+        { role: 'asc' },
+        { firstName: 'asc' },
+        { lastName: 'asc' },
+      ],
+    });
+  }
+
+  if (role === Role.STUDENT) {
+    const student = await prisma.student.findUnique({
+      where: { userId },
+      select: {
+        classId: true,
+      },
+    });
+
+    return prisma.user.findMany({
+      where: {
+        isActive: true,
+        id: { not: userId },
+        OR: [
+          { role: Role.ADMIN },
+          ...(student?.classId
+            ? [
+                {
+                  teacherProfile: {
+                    is: {
+                      schedules: {
+                        some: {
+                          classId: student.classId,
+                        },
+                      },
+                    },
+                  },
+                },
+              ]
+            : []),
+        ],
+      },
+      select: messageUserSelect,
+      orderBy: [
+        { role: 'asc' },
+        { firstName: 'asc' },
+        { lastName: 'asc' },
+      ],
+    });
+  }
+
+  if (role === Role.PARENT) {
+    const parent = await prisma.parent.findUnique({
+      where: { userId },
+      include: {
+        children: {
+          select: {
+            classId: true,
+          },
+        },
+      },
+    });
+
+    const classIds = uniqueStringValues(
+      (parent?.children ?? []).map((child) => child.classId)
+    );
+
+    return prisma.user.findMany({
+      where: {
+        isActive: true,
+        id: { not: userId },
+        OR: [
+          { role: Role.ADMIN },
+          ...(classIds.length > 0
+            ? [
+                {
+                  teacherProfile: {
+                    is: {
+                      schedules: {
+                        some: {
+                          classId: {
+                            in: classIds,
+                          },
+                        },
+                      },
+                    },
+                  },
+                },
+              ]
+            : []),
+        ],
+      },
+      select: messageUserSelect,
+      orderBy: [
+        { role: 'asc' },
+        { firstName: 'asc' },
+        { lastName: 'asc' },
+      ],
+    });
+  }
+
+  return [];
+};
+
 app.get('/', (req: Request, res: Response) => res.send('🎉 API is running!'));
+
+app.get('/api/health', async (req: Request, res: Response): Promise<any> => {
+  try {
+    await prisma.$queryRaw`SELECT 1`;
+
+    res.json({
+      status: "ok",
+      api: "running",
+      database: "connected",
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.error("GET /api/health error:", error);
+
+    res.status(500).json({
+      status: "error",
+      api: "running",
+      database: "disconnected",
+      timestamp: new Date().toISOString(),
+    });
+  }
+});
 
 app.post('/api/login', async (req: Request, res: Response): Promise<any> => {
   try {
-    const { email, password } = req.body;
-    const user = await prisma.user.findUnique({ where: { email } });
-    if (!user) return res.status(404).json({ error: "User not found!" });
-    const isPasswordValid = await bcrypt.compare(password, user.passwordHash);
-    if (!isPasswordValid) return res.status(401).json({ error: "Invalid password!" });
-    const token = jwt.sign({ userId: user.id, role: user.role, firstName: user.firstName }, JWT_SECRET, { expiresIn: '1d' });
-    res.json({ message: "Login successful!", token, role: user.role, firstName: user.firstName, lastName: user.lastName });
-  } catch (error) { res.status(500).json({ error: "Login failed" }); }
+    const normalizedEmail = String(req.body.email ?? '').trim().toLowerCase();
+    const normalizedPassword = String(req.body.password ?? '');
+
+    if (!normalizedEmail || !normalizedPassword) {
+      return res.status(400).json({
+        error: 'email and password are required!',
+      });
+    }
+
+    const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+    if (!emailPattern.test(normalizedEmail)) {
+      return res.status(400).json({
+        error: 'Email must be valid!',
+      });
+    }
+
+    const user = await prisma.user.findUnique({
+      where: { email: normalizedEmail },
+    });
+
+    if (!user) {
+      return res.status(404).json({ error: "User not found!" });
+    }
+
+    if (!user.isActive) {
+      return res.status(403).json({ error: 'This account is inactive.' });
+    }
+
+    const isPasswordValid = await bcrypt.compare(
+      normalizedPassword,
+      user.passwordHash
+    );
+
+    if (!isPasswordValid) {
+      return res.status(401).json({ error: "Invalid password!" });
+    }
+
+    const token = jwt.sign(
+      { userId: user.id, role: user.role, firstName: user.firstName },
+      JWT_SECRET,
+      { expiresIn: '1d' }
+    );
+
+    res.json({
+      message: "Login successful!",
+      token,
+      role: user.role,
+      firstName: user.firstName,
+      lastName: user.lastName,
+    });
+  } catch (error) {
+    res.status(500).json({ error: "Login failed" });
+  }
 });
 
 // USERS
-app.post('/api/register', authenticateToken, async (req: Request, res: Response): Promise<any> => {
+app.post('/api/register', authenticateToken, requireAdmin, async (req: Request, res: Response): Promise<any> => {
   try {
     const { email, password, firstName, lastName, role, classId, studentUserId } = req.body;
-    const existingUser = await prisma.user.findUnique({ where: { email } });
-    if (existingUser) return res.status(400).json({ error: "Email already in use!" });
-    const salt = await bcrypt.genSalt(10);
-    const hashedPassword = await bcrypt.hash(password, salt);
-    
-    const newUser = await prisma.user.create({ data: { email, passwordHash: hashedPassword, firstName, lastName, role: role || 'STUDENT' } });
 
-    if (role === 'STUDENT') await prisma.student.create({ data: { userId: newUser.id, dateOfBirth: new Date(), classId: classId || null } });
-    else if (role === 'PARENT') {
-      const newParent = await prisma.parent.create({ data: { userId: newUser.id } });
-      if (studentUserId) {
-        const studentProfile = await prisma.student.findUnique({ where: { userId: studentUserId } });
-        if (studentProfile) await prisma.student.update({ where: { id: studentProfile.id }, data: { parentId: newParent.id } });
+    const normalizedEmail = String(email ?? '').trim().toLowerCase();
+    const normalizedFirstName = String(firstName ?? '').trim();
+    const normalizedLastName = String(lastName ?? '').trim();
+    const normalizedPassword = String(password ?? '');
+    const normalizedRole = String(role ?? Role.STUDENT).trim().toUpperCase() as Role;
+
+    const normalizedClassId =
+      classId === undefined || classId === null || String(classId).trim() === ''
+        ? null
+        : String(classId).trim();
+
+    const normalizedStudentUserId =
+      studentUserId === undefined || studentUserId === null || String(studentUserId).trim() === ''
+        ? null
+        : String(studentUserId).trim();
+
+    const allowedRoles: Role[] = [
+      Role.ADMIN,
+      Role.TEACHER,
+      Role.STUDENT,
+      Role.PARENT,
+    ];
+
+    if (!normalizedEmail || !normalizedPassword || !normalizedFirstName || !normalizedLastName) {
+      return res.status(400).json({
+        error: 'email, password, firstName and lastName are required!',
+      });
+    }
+
+    const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+    if (!emailPattern.test(normalizedEmail)) {
+      return res.status(400).json({
+        error: 'Email must be valid!',
+      });
+    }
+
+    if (!allowedRoles.includes(normalizedRole)) {
+      return res.status(400).json({
+        error: 'Role is invalid!',
+      });
+    }
+
+    const existingUser = await prisma.user.findUnique({
+      where: { email: normalizedEmail },
+      select: { id: true },
+    });
+
+    if (existingUser) {
+      return res.status(400).json({ error: 'Email already in use!' });
+    }
+
+    let validatedClassId: string | null = null;
+
+    if (normalizedRole === Role.STUDENT && normalizedClassId) {
+      const existingClass = await prisma.class.findUnique({
+        where: { id: normalizedClassId },
+        select: { id: true },
+      });
+
+      if (!existingClass) {
+        return res.status(400).json({
+          error: 'Selected class does not exist!',
+        });
       }
-    } else if (role === 'TEACHER') await prisma.teacher.create({ data: { userId: newUser.id, specialty: "General", hireDate: new Date() } });
 
-    res.status(201).json({ message: "User created!" });
-  } catch (error) { res.status(500).json({ error: "Registration failed" }); }
+      validatedClassId = existingClass.id;
+    }
+
+    let studentToLink: { id: string; parentId: string | null } | null = null;
+
+    if (normalizedRole === Role.PARENT && normalizedStudentUserId) {
+      studentToLink = await prisma.student.findUnique({
+        where: { userId: normalizedStudentUserId },
+        select: {
+          id: true,
+          parentId: true,
+        },
+      });
+
+      if (!studentToLink) {
+        return res.status(400).json({
+          error: 'Selected student does not exist!',
+        });
+      }
+
+      if (studentToLink.parentId) {
+        return res.status(400).json({
+          error: 'This student is already linked to a parent!',
+        });
+      }
+    }
+
+    const salt = await bcrypt.genSalt(10);
+    const hashedPassword = await bcrypt.hash(normalizedPassword, salt);
+
+    await prisma.$transaction(async (tx) => {
+      const newUser = await tx.user.create({
+        data: {
+          email: normalizedEmail,
+          passwordHash: hashedPassword,
+          firstName: normalizedFirstName,
+          lastName: normalizedLastName,
+          role: normalizedRole,
+        },
+      });
+
+      if (normalizedRole === Role.STUDENT) {
+        await tx.student.create({
+          data: {
+            userId: newUser.id,
+            dateOfBirth: new Date(),
+            classId: validatedClassId,
+          },
+        });
+      } else if (normalizedRole === Role.PARENT) {
+        const newParent = await tx.parent.create({
+          data: {
+            userId: newUser.id,
+          },
+        });
+
+        if (studentToLink) {
+          await tx.student.update({
+            where: { id: studentToLink.id },
+            data: { parentId: newParent.id },
+          });
+        }
+      } else if (normalizedRole === Role.TEACHER) {
+        await tx.teacher.create({
+          data: {
+            userId: newUser.id,
+            specialty: 'General',
+            hireDate: new Date(),
+          },
+        });
+      }
+    });
+
+    return res.status(201).json({ message: 'User created!' });
+  } catch (error) {
+    console.error('POST /api/register error:', error);
+    return res.status(500).json({ error: 'Registration failed' });
+  }
 });
-app.get('/api/users', authenticateToken, async (req: Request, res: Response) => {
+app.get('/api/users', authenticateToken, requireAdmin, async (req: Request, res: Response) => {
   try { res.json(await prisma.user.findMany({ select: { id: true, firstName: true, lastName: true, email: true, role: true, createdAt: true }, orderBy: { createdAt: 'desc' } })); } 
   catch (error) { res.status(500).json({ error: "Failed to fetch users" }); }
 });
-app.put('/api/users/:id', authenticateToken, async (req: Request, res: Response): Promise<any> => {
-  try { await prisma.user.update({ where: { id: req.params.id as string }, data: { firstName: req.body.firstName, lastName: req.body.lastName, email: req.body.email } }); res.json({ message: "Updated!" }); } 
-  catch (error) { res.status(500).json({ error: "Failed to update user" }); }
+app.put('/api/users/:id', authenticateToken, requireAdmin, async (req: Request, res: Response): Promise<any> => {
+  try {
+    const userId = req.params.id as string;
+    const normalizedFirstName = String(req.body.firstName ?? '').trim();
+    const normalizedLastName = String(req.body.lastName ?? '').trim();
+    const normalizedEmail = String(req.body.email ?? '').trim().toLowerCase();
+
+    if (!normalizedFirstName || !normalizedLastName || !normalizedEmail) {
+      return res.status(400).json({
+        error: 'firstName, lastName and email are required!',
+      });
+    }
+
+    const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+    if (!emailPattern.test(normalizedEmail)) {
+      return res.status(400).json({
+        error: 'Email must be valid!',
+      });
+    }
+
+    const existingUser = await prisma.user.findUnique({
+      where: { id: userId },
+      select: { id: true },
+    });
+
+    if (!existingUser) {
+      return res.status(404).json({ error: 'User not found!' });
+    }
+
+    const emailOwner = await prisma.user.findUnique({
+      where: { email: normalizedEmail },
+      select: { id: true },
+    });
+
+    if (emailOwner && emailOwner.id !== userId) {
+      return res.status(400).json({ error: 'Email already in use!' });
+    }
+
+    await prisma.user.update({
+      where: { id: userId },
+      data: {
+        firstName: normalizedFirstName,
+        lastName: normalizedLastName,
+        email: normalizedEmail,
+      },
+    });
+
+    res.json({ message: 'Updated!' });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to update user' });
+  }
 });
-app.delete('/api/users/:id', authenticateToken, async (req: Request, res: Response): Promise<any> => {
+app.delete('/api/users/:id', authenticateToken, requireAdmin, async (req: Request, res: Response): Promise<any> => {
   try {
     const userId = req.params.id as string;
     await prisma.student.deleteMany({ where: { userId } });
@@ -107,33 +734,172 @@ app.delete('/api/users/:id', authenticateToken, async (req: Request, res: Respon
 });
 
 // STATS, CLASSES, SUBJECTS, TEACHERS, SCHEDULES, ATTENDANCE, GRADES (Unchanged)
-app.get('/api/stats', authenticateToken, async (req: Request, res: Response) => { try { res.json({ totalUsers: await prisma.user.count(), totalTeachers: await prisma.user.count({ where: { role: 'TEACHER' } }), totalStudents: await prisma.user.count({ where: { role: 'STUDENT' } }), totalAdmins: await prisma.user.count({ where: { role: 'ADMIN' } }) }); } catch (error) { res.status(500).json({ error: "Failed" }); } });
-app.get('/api/classes', authenticateToken, async (req: Request, res: Response) => { try { res.json(await prisma.class.findMany({ include: { _count: { select: { students: true } } }, orderBy: { name: 'asc' } })); } catch (error) { res.status(500).json({ error: "Failed" }); } });
-app.post('/api/classes', authenticateToken, async (req: Request, res: Response): Promise<any> => { try { res.status(201).json(await prisma.class.create({ data: { name: req.body.name, academicYear: req.body.academicYear } })); } catch (error) { res.status(500).json({ error: "Failed" }); } });
-app.get('/api/classes/:id', authenticateToken, async (req: Request, res: Response): Promise<any> => { try { res.json(await prisma.class.findUnique({ where: { id: req.params.id as string }, include: { students: { include: { user: { select: { firstName: true, lastName: true, email: true } } } } } })); } catch (error) { res.status(500).json({ error: "Failed" }); } });
-app.delete('/api/classes/:id', authenticateToken, async (req: Request, res: Response): Promise<any> => { try { await prisma.class.delete({ where: { id: req.params.id as string } }); res.json({ message: "Deleted!" }); } catch (error) { res.status(500).json({ error: "Failed" }); } });
-app.get('/api/subjects', authenticateToken, async (req: Request, res: Response) => { try { res.json(await prisma.subject.findMany({ orderBy: { name: 'asc' } })); } catch (error) { res.status(500).json({ error: "Failed" }); } });
-app.post('/api/subjects', authenticateToken, async (req: Request, res: Response): Promise<any> => { try { res.status(201).json(await prisma.subject.create({ data: { name: req.body.name, coefficient: parseFloat(req.body.coefficient) } })); } catch (error) { res.status(500).json({ error: "Failed" }); } });
-app.delete('/api/subjects/:id', authenticateToken, async (req: Request, res: Response): Promise<any> => { try { await prisma.subject.delete({ where: { id: req.params.id as string } }); res.json({ message: "Deleted!" }); } catch (error) { res.status(500).json({ error: "Failed" }); } });
-app.get('/api/teachers', authenticateToken, async (req: Request, res: Response) => { try { res.json(await prisma.teacher.findMany({ include: { user: true } })); } catch (error) { res.status(500).json({ error: "Failed" }); } });
-app.get('/api/schedules', authenticateToken, async (req: Request, res: Response) => {
+app.get('/api/stats', authenticateToken, requireAdmin, async (req: Request, res: Response) => { try { res.json({ totalUsers: await prisma.user.count(), totalTeachers: await prisma.user.count({ where: { role: 'TEACHER' } }), totalStudents: await prisma.user.count({ where: { role: 'STUDENT' } }), totalAdmins: await prisma.user.count({ where: { role: 'ADMIN' } }) }); } catch (error) { res.status(500).json({ error: "Failed" }); } });
+app.get('/api/classes', authenticateToken, requireAdmin, async (req: Request, res: Response) => { try { res.json(await prisma.class.findMany({ include: { _count: { select: { students: true } } }, orderBy: { name: 'asc' } })); } catch (error) { res.status(500).json({ error: "Failed" }); } });
+app.post('/api/classes', authenticateToken, requireAdmin, async (req: Request, res: Response): Promise<any> => {
+  try {
+    const normalizedName = String(req.body.name ?? '').trim();
+    const normalizedAcademicYear = String(req.body.academicYear ?? '').trim();
+
+    if (!normalizedName || !normalizedAcademicYear) {
+      return res.status(400).json({
+        error: 'name and academicYear are required!',
+      });
+    }
+
+    const existingClass = await prisma.class.findFirst({
+      where: {
+        name: normalizedName,
+        academicYear: normalizedAcademicYear,
+      },
+      select: { id: true },
+    });
+
+    if (existingClass) {
+      return res.status(400).json({
+        error: 'A class with the same name and academic year already exists!',
+      });
+    }
+
+    const createdClass = await prisma.class.create({
+      data: {
+        name: normalizedName,
+        academicYear: normalizedAcademicYear,
+      },
+    });
+
+    res.status(201).json(createdClass);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed' });
+  }
+});
+app.get('/api/classes/:id', authenticateToken, requireAdmin, async (req: Request, res: Response): Promise<any> => { try { res.json(await prisma.class.findUnique({ where: { id: req.params.id as string }, include: { students: { include: { user: { select: { firstName: true, lastName: true, email: true } } } } } })); } catch (error) { res.status(500).json({ error: "Failed" }); } });
+app.delete('/api/classes/:id', authenticateToken, requireAdmin, async (req: Request, res: Response): Promise<any> => { try { await prisma.class.delete({ where: { id: req.params.id as string } }); res.json({ message: "Deleted!" }); } catch (error) { res.status(500).json({ error: "Failed" }); } });
+app.get('/api/subjects', authenticateToken, requireAdmin, async (req: Request, res: Response) => { try { res.json(await prisma.subject.findMany({ orderBy: { name: 'asc' } })); } catch (error) { res.status(500).json({ error: "Failed" }); } });
+app.post('/api/subjects', authenticateToken, requireAdmin, async (req: Request, res: Response): Promise<any> => {
+  try {
+    const normalizedName = String(req.body.name ?? '').trim();
+    const { coefficient } = req.body;
+
+    if (!normalizedName || coefficient === undefined || coefficient === null) {
+      return res.status(400).json({
+        error: 'name and coefficient are required!',
+      });
+    }
+
+    const numericCoefficient = parseFloat(String(coefficient));
+
+    if (Number.isNaN(numericCoefficient)) {
+      return res.status(400).json({
+        error: 'Coefficient must be a valid number!',
+      });
+    }
+
+    if (numericCoefficient <= 0) {
+      return res.status(400).json({
+        error: 'Coefficient must be greater than 0!',
+      });
+    }
+
+    const existingSubject = await prisma.subject.findFirst({
+      where: {
+        name: normalizedName,
+      },
+      select: { id: true },
+    });
+
+    if (existingSubject) {
+      return res.status(400).json({
+        error: 'A subject with the same name already exists!',
+      });
+    }
+
+    const createdSubject = await prisma.subject.create({
+      data: {
+        name: normalizedName,
+        coefficient: numericCoefficient,
+      },
+    });
+
+    res.status(201).json(createdSubject);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed' });
+  }
+});
+app.delete('/api/subjects/:id', authenticateToken, requireAdmin, async (req: Request, res: Response): Promise<any> => { try { await prisma.subject.delete({ where: { id: req.params.id as string } }); res.json({ message: "Deleted!" }); } catch (error) { res.status(500).json({ error: "Failed" }); } });
+app.get('/api/teachers', authenticateToken, requireAdmin, async (req: Request, res: Response) => {
   try {
     res.json(
-      await prisma.schedule.findMany({
+      await prisma.teacher.findMany({
         include: {
-          class: { include: { students: { include: { user: true } } } },
-          subject: true,
-          teacher: { include: { user: true } }
+          user: {
+            select: publicUserSelect,
+          },
         },
-        orderBy: { dayOfWeek: 'asc' }
       })
     );
   } catch (error) {
     res.status(500).json({ error: "Failed" });
   }
 });
+app.get('/api/schedules', authenticateToken, async (req: Request, res: Response): Promise<any> => {
+  try {
+    const userId = (req as any).user.userId;
+    const role = (req as any).user.role;
 
-app.post('/api/schedules', authenticateToken, async (req: Request, res: Response): Promise<any> => {
+    if (role !== 'ADMIN' && role !== 'TEACHER') {
+      return res.status(403).json({ error: 'Only admins and teachers can view schedules.' });
+    }
+
+    let teacherIdFilter: string | undefined;
+
+    if (role === 'TEACHER') {
+      const teacherId = await getTeacherProfileId(userId);
+
+      if (!teacherId) {
+        return res.status(404).json({ error: 'Teacher profile not found!' });
+      }
+
+      teacherIdFilter = teacherId;
+    }
+
+    const schedules = await prisma.schedule.findMany({
+      where: teacherIdFilter ? { teacherId: teacherIdFilter } : undefined,
+      include: {
+  class: {
+    include: {
+      students: {
+        include: {
+          user: {
+            select: publicUserSelect,
+          },
+        },
+      },
+    },
+  },
+  subject: true,
+  teacher: {
+    include: {
+      user: {
+        select: publicUserSelect,
+      },
+    },
+  },
+},
+      orderBy: [
+        { dayOfWeek: 'asc' },
+        { startTime: 'asc' },
+      ],
+    });
+
+    res.json(schedules);
+  } catch (error) {
+    console.error('GET /api/schedules error:', error);
+    res.status(500).json({ error: 'Failed' });
+  }
+});
+
+app.post('/api/schedules', authenticateToken, requireAdmin, async (req: Request, res: Response): Promise<any> => {
   try {
     const { classId, subjectId, teacherId, dayOfWeek, startTime, endTime } = req.body;
 
@@ -141,19 +907,61 @@ app.post('/api/schedules', authenticateToken, async (req: Request, res: Response
       return res.status(400).json({ error: "All fields are required!" });
     }
 
+    const normalizedDayOfWeek = String(dayOfWeek).trim();
+    const normalizedStartTime = String(startTime).trim();
+    const normalizedEndTime = String(endTime).trim();
+
+    if (!normalizedDayOfWeek) {
+      return res.status(400).json({ error: "dayOfWeek is required!" });
+    }
+
+    if (!isValidTimeValue(normalizedStartTime) || !isValidTimeValue(normalizedEndTime)) {
+      return res.status(400).json({
+        error: "startTime and endTime must use HH:MM format!",
+      });
+    }
+
+    if (normalizedEndTime <= normalizedStartTime) {
+      return res.status(400).json({
+        error: "endTime must be later than startTime!",
+      });
+    }
+
+    const { classConflict, teacherConflict } = await findScheduleConflicts({
+  classId,
+  teacherId,
+  dayOfWeek: normalizedDayOfWeek,
+  startTime: normalizedStartTime,
+  endTime: normalizedEndTime,
+});
+
+if (classConflict) {
+  return res.status(409).json({
+    error: 'This class already has another schedule that overlaps with this time slot.',
+  });
+}
+
+if (teacherConflict) {
+  return res.status(409).json({
+    error: 'This teacher already has another schedule that overlaps with this time slot.',
+  });
+}
+
     const createdSchedule = await prisma.schedule.create({
       data: {
         classId,
         subjectId,
         teacherId,
-        dayOfWeek,
-        startTime,
-        endTime
+        dayOfWeek: normalizedDayOfWeek,
+        startTime: normalizedStartTime,
+        endTime: normalizedEndTime
       },
       include: {
         class: true,
         subject: true,
-        teacher: { include: { user: true } }
+        teacher: { include: { user: {
+  select: publicUserSelect,
+} } }
       }
     });
 
@@ -163,13 +971,33 @@ app.post('/api/schedules', authenticateToken, async (req: Request, res: Response
   }
 });
 
-app.put('/api/schedules/:id', authenticateToken, async (req: Request, res: Response): Promise<any> => {
+app.put('/api/schedules/:id', authenticateToken, requireAdmin, async (req: Request, res: Response): Promise<any> => {
   try {
     const scheduleId = req.params.id as string;
     const { classId, subjectId, teacherId, dayOfWeek, startTime, endTime } = req.body;
 
     if (!classId || !subjectId || !teacherId || !dayOfWeek || !startTime || !endTime) {
       return res.status(400).json({ error: "All fields are required!" });
+    }
+
+    const normalizedDayOfWeek = String(dayOfWeek).trim();
+    const normalizedStartTime = String(startTime).trim();
+    const normalizedEndTime = String(endTime).trim();
+
+    if (!normalizedDayOfWeek) {
+      return res.status(400).json({ error: "dayOfWeek is required!" });
+    }
+
+    if (!isValidTimeValue(normalizedStartTime) || !isValidTimeValue(normalizedEndTime)) {
+      return res.status(400).json({
+        error: "startTime and endTime must use HH:MM format!",
+      });
+    }
+
+    if (normalizedEndTime <= normalizedStartTime) {
+      return res.status(400).json({
+        error: "endTime must be later than startTime!",
+      });
     }
 
     const existingSchedule = await prisma.schedule.findUnique({
@@ -180,20 +1008,43 @@ app.put('/api/schedules/:id', authenticateToken, async (req: Request, res: Respo
       return res.status(404).json({ error: "Schedule not found!" });
     }
 
+    const { classConflict, teacherConflict } = await findScheduleConflicts({
+  classId,
+  teacherId,
+  dayOfWeek: normalizedDayOfWeek,
+  startTime: normalizedStartTime,
+  endTime: normalizedEndTime,
+  excludeScheduleId: scheduleId,
+});
+
+if (classConflict) {
+  return res.status(409).json({
+    error: 'This class already has another schedule that overlaps with this time slot.',
+  });
+}
+
+if (teacherConflict) {
+  return res.status(409).json({
+    error: 'This teacher already has another schedule that overlaps with this time slot.',
+  });
+}
+
     const updatedSchedule = await prisma.schedule.update({
       where: { id: scheduleId },
       data: {
         classId,
         subjectId,
         teacherId,
-        dayOfWeek,
-        startTime,
-        endTime
+        dayOfWeek: normalizedDayOfWeek,
+        startTime: normalizedStartTime,
+        endTime: normalizedEndTime
       },
       include: {
         class: true,
         subject: true,
-        teacher: { include: { user: true } }
+        teacher: { include: { user: {
+  select: publicUserSelect,
+} } }
       }
     });
 
@@ -203,7 +1054,7 @@ app.put('/api/schedules/:id', authenticateToken, async (req: Request, res: Respo
   }
 });
 
-app.delete('/api/schedules/:id', authenticateToken, async (req: Request, res: Response): Promise<any> => {
+app.delete('/api/schedules/:id', authenticateToken, requireAdmin, async (req: Request, res: Response): Promise<any> => {
   try {
     await prisma.schedule.delete({ where: { id: req.params.id as string } });
     res.json({ message: "Deleted!" });
@@ -211,95 +1062,398 @@ app.delete('/api/schedules/:id', authenticateToken, async (req: Request, res: Re
     res.status(500).json({ error: "Failed" });
   }
 });
-app.get('/api/attendance/:scheduleId', authenticateToken, async (req: Request, res: Response): Promise<any> => { try { const scheduleId = req.params.scheduleId as string; const targetDate = new Date(req.query.date as string); const startDate = new Date(targetDate); startDate.setHours(0,0,0,0); const endDate = new Date(targetDate); endDate.setHours(23,59,59,999); res.json(await prisma.attendance.findMany({ where: { scheduleId: scheduleId, date: { gte: startDate, lte: endDate } } })); } catch (error) { res.status(500).json({ error: "Failed" }); } });
-app.post('/api/attendance', authenticateToken, async (req: Request, res: Response): Promise<any> => { try { const { studentId, scheduleId, status, date } = req.body; const targetDate = new Date(date); const startDate = new Date(targetDate); startDate.setHours(0,0,0,0); const endDate = new Date(targetDate); endDate.setHours(23,59,59,999); const existing = await prisma.attendance.findFirst({ where: { studentId, scheduleId, date: { gte: startDate, lte: endDate } } }); if (existing) await prisma.attendance.update({ where: { id: existing.id }, data: { status } }); else await prisma.attendance.create({ data: { studentId, scheduleId, status, date: targetDate } }); res.json({ message: "Attendance saved!" }); } catch (error) { res.status(500).json({ error: "Failed" }); } });
-app.get('/api/grades/:classId/:subjectId', authenticateToken, async (req: Request, res: Response): Promise<any> => {
+app.get('/api/attendance/:scheduleId', authenticateToken, async (req: Request, res: Response): Promise<any> => {
   try {
-    const classId = req.params.classId as string;
-    const subjectId = req.params.subjectId as string;
-    const period = parseGradePeriod(req.query.period as string | undefined);
+    const userId = (req as any).user.userId;
+    const role = (req as any).user.role;
+    const scheduleId = req.params.scheduleId as string;
+    const rawDate = req.query.date as string | undefined;
 
-    const students = await prisma.student.findMany({
-      where: { classId },
-      include: {
-        user: true,
-        grades: {
-          where: {
-            subjectId,
-            period,
-          },
+    if (role !== 'ADMIN' && role !== 'TEACHER') {
+      return res.status(403).json({ error: 'Only admins and teachers can view attendance.' });
+    }
+
+    const schedule = await prisma.schedule.findUnique({
+      where: { id: scheduleId },
+      select: {
+        id: true,
+        teacherId: true,
+        classId: true,
+      },
+    });
+
+    if (!schedule) {
+      return res.status(404).json({ error: 'Schedule not found!' });
+    }
+
+    if (role === 'TEACHER') {
+      const teacherId = await getTeacherProfileId(userId);
+
+      if (!teacherId) {
+        return res.status(404).json({ error: 'Teacher profile not found!' });
+      }
+
+      if (schedule.teacherId !== teacherId) {
+        return res.status(403).json({
+          error: 'You can only view attendance for your own schedules.',
+        });
+      }
+    }
+
+    if (!rawDate) {
+      return res.status(400).json({ error: 'date query parameter is required!' });
+    }
+
+    const targetDate = new Date(rawDate);
+
+    if (Number.isNaN(targetDate.getTime())) {
+      return res.status(400).json({ error: 'date must be a valid date!' });
+    }
+
+    const startDate = new Date(targetDate);
+    startDate.setHours(0, 0, 0, 0);
+
+    const endDate = new Date(targetDate);
+    endDate.setHours(23, 59, 59, 999);
+
+    const rows = await prisma.attendance.findMany({
+      where: {
+        scheduleId,
+        date: {
+          gte: startDate,
+          lte: endDate,
         },
       },
     });
 
+    res.json(rows);
+  } catch (error) {
+    console.error('GET /api/attendance/:scheduleId error:', error);
+    res.status(500).json({ error: 'Failed' });
+  }
+});
+app.post('/api/attendance', authenticateToken, async (req: Request, res: Response): Promise<any> => {
+  try {
+    const userId = (req as any).user.userId;
+    const role = (req as any).user.role;
+    const { studentId, scheduleId, status, date } = req.body;
+
+    if (role !== 'ADMIN' && role !== 'TEACHER') {
+      return res.status(403).json({ error: 'Only admins and teachers can save attendance.' });
+    }
+
+    if (!studentId || !scheduleId || !status || !date) {
+      return res.status(400).json({
+        error: 'studentId, scheduleId, status and date are required!',
+      });
+    }
+
+    const normalizedStatus = parseAttendanceStatus(status);
+
+    if (!normalizedStatus) {
+      return res.status(400).json({
+        error: 'status must be PRESENT, ABSENT or LATE!',
+      });
+    }
+
+    const schedule = await prisma.schedule.findUnique({
+      where: { id: scheduleId },
+      select: {
+        id: true,
+        teacherId: true,
+        classId: true,
+      },
+    });
+
+    if (!schedule) {
+      return res.status(404).json({ error: 'Schedule not found!' });
+    }
+
+    if (role === 'TEACHER') {
+      const teacherId = await getTeacherProfileId(userId);
+
+      if (!teacherId) {
+        return res.status(404).json({ error: 'Teacher profile not found!' });
+      }
+
+      if (schedule.teacherId !== teacherId) {
+        return res.status(403).json({
+          error: 'You can only save attendance for your own schedules.',
+        });
+      }
+    }
+
+    const student = await prisma.student.findUnique({
+      where: { id: studentId },
+      select: {
+        id: true,
+        classId: true,
+      },
+    });
+
+    if (!student) {
+      return res.status(404).json({ error: 'Student not found!' });
+    }
+
+    if (student.classId !== schedule.classId) {
+      return res.status(400).json({
+        error: 'This student does not belong to the class of the selected schedule.',
+      });
+    }
+
+    const targetDate = new Date(date);
+
+    if (Number.isNaN(targetDate.getTime())) {
+      return res.status(400).json({ error: 'date must be a valid date!' });
+    }
+
+    const startDate = new Date(targetDate);
+    startDate.setHours(0, 0, 0, 0);
+
+    const endDate = new Date(targetDate);
+    endDate.setHours(23, 59, 59, 999);
+
+    const existing = await prisma.attendance.findFirst({
+      where: {
+        studentId,
+        scheduleId,
+        date: {
+          gte: startDate,
+          lte: endDate,
+        },
+      },
+    });
+
+    if (existing) {
+      await prisma.attendance.update({
+        where: { id: existing.id },
+        data: { status: normalizedStatus },
+      });
+    } else {
+      await prisma.attendance.create({
+        data: {
+          studentId,
+          scheduleId,
+          status: normalizedStatus,
+          date: targetDate,
+        },
+      });
+    }
+
+    res.json({ message: 'Attendance saved!' });
+  } catch (error) {
+    console.error('POST /api/attendance error:', error);
+    res.status(500).json({ error: 'Failed' });
+  }
+});
+app.get('/api/grades/:classId/:subjectId', authenticateToken, async (req: Request, res: Response): Promise<any> => {
+  try {
+    const userId = (req as any).user.userId;
+    const role = (req as any).user.role;
+    const classId = req.params.classId as string;
+    const subjectId = req.params.subjectId as string;
+    const period = parseGradePeriod(req.query.period as string | undefined);
+
+    if (role !== 'ADMIN' && role !== 'TEACHER') {
+      return res.status(403).json({ error: 'Only admins and teachers can view grades.' });
+    }
+
+    if (role === 'TEACHER') {
+      const teacherId = await getTeacherProfileId(userId);
+
+      if (!teacherId) {
+        return res.status(404).json({ error: 'Teacher profile not found!' });
+      }
+
+      const allowed = await teacherHasClassSubjectScope(teacherId, classId, subjectId);
+
+      if (!allowed) {
+        return res.status(403).json({
+          error: 'You can only view grades for your own classes and subjects.',
+        });
+      }
+    }
+
+    const students = await prisma.student.findMany({
+  where: { classId },
+  include: {
+    user: {
+      select: publicUserSelect,
+    },
+    grades: {
+      where: {
+        subjectId,
+        period,
+      },
+    },
+  },
+});
+
     res.json(students);
   } catch (error) {
-  console.error('GET /api/grades error:', error);
-  res.status(500).json({ error: "Failed" });
-}
+    console.error('GET /api/grades error:', error);
+    res.status(500).json({ error: 'Failed' });
+  }
 });
 app.post('/api/grades', authenticateToken, async (req: Request, res: Response): Promise<any> => {
   try {
+    const userId = (req as any).user.userId;
+    const role = (req as any).user.role;
     const { studentId, subjectId, examType, period, score, comments } = req.body;
 
+    if (role !== 'ADMIN' && role !== 'TEACHER') {
+      return res.status(403).json({ error: 'Only admins and teachers can save grades.' });
+    }
+
     if (!studentId || !subjectId || !examType || score === undefined || score === null) {
-      return res.status(400).json({ error: "studentId, subjectId, examType, and score are required!" });
+      return res.status(400).json({ error: 'studentId, subjectId, examType, and score are required!' });
+    }
+
+    const normalizedExamType = String(examType).trim();
+
+    if (!normalizedExamType) {
+      return res.status(400).json({ error: 'examType is required!' });
+    }
+
+    const studentProfile = await prisma.student.findUnique({
+      where: { id: studentId },
+      include: {
+        user: {
+  select: publicUserSelect,
+},
+        parent: true,
+      },
+    });
+
+    if (!studentProfile) {
+      return res.status(404).json({ error: 'Student not found!' });
+    }
+
+    if (!studentProfile.classId) {
+      return res.status(400).json({ error: 'Student is not linked to a class.' });
+    }
+
+    if (role === 'TEACHER') {
+      const teacherId = await getTeacherProfileId(userId);
+
+      if (!teacherId) {
+        return res.status(404).json({ error: 'Teacher profile not found!' });
+      }
+
+      const allowed = await teacherHasClassSubjectScope(
+        teacherId,
+        studentProfile.classId,
+        subjectId
+      );
+
+      if (!allowed) {
+        return res.status(403).json({
+          error: 'You can only save grades for your own classes and subjects.',
+        });
+      }
     }
 
     const gradePeriod = parseGradePeriod(period);
-    const numericScore = parseFloat(score);
+    const numericScore = parseFloat(String(score));
 
     if (Number.isNaN(numericScore)) {
-      return res.status(400).json({ error: "Score must be a valid number!" });
+      return res.status(400).json({ error: 'Score must be a valid number!' });
+    }
+
+    if (numericScore < 0 || numericScore > 20) {
+      return res.status(400).json({ error: 'Score must be between 0 and 20!' });
     }
 
     const existing = await prisma.grade.findFirst({
       where: {
         studentId,
         subjectId,
-        examType,
+        examType: normalizedExamType,
         period: gradePeriod,
       },
     });
 
+    let savedGrade;
+
     if (existing) {
-      await prisma.grade.update({
+      savedGrade = await prisma.grade.update({
         where: { id: existing.id },
         data: {
           score: numericScore,
-          comments,
+          comments: comments ? String(comments).trim() : null,
           period: gradePeriod,
         },
       });
     } else {
-      await prisma.grade.create({
+      savedGrade = await prisma.grade.create({
         data: {
           studentId,
           subjectId,
-          examType,
+          examType: normalizedExamType,
           period: gradePeriod,
           score: numericScore,
-          comments,
+          comments: comments ? String(comments).trim() : null,
         },
       });
     }
 
-    res.json({ message: "Grade saved!" });
+    const subjectInfo = await prisma.subject.findUnique({
+      where: { id: subjectId },
+    });
+
+    const notificationUserIds = [
+      studentProfile.userId,
+      studentProfile.parent?.userId,
+    ].filter(Boolean) as string[];
+
+    await createNotificationsForUserIds(
+      notificationUserIds,
+      'New grade published',
+      `A new ${subjectInfo?.name ?? 'subject'} grade (${numericScore}/20) was added for ${gradePeriod}.`,
+      'GRADE',
+      savedGrade.id
+    );
+
+    res.json({ message: 'Grade saved!', grade: savedGrade });
   } catch (error) {
-  console.error('POST /api/grades error:', error);
-  res.status(500).json({ error: "Failed" });
-}
+    console.error('POST /api/grades error:', error);
+    res.status(500).json({ error: 'Failed' });
+  }
 });
 
 app.get('/api/student-summary/:studentId', authenticateToken, async (req: Request, res: Response): Promise<any> => {
   try {
+    const userId = (req as any).user.userId;
+    const role = (req as any).user.role;
     const studentId = req.params.studentId as string;
     const period = parseGradePeriod(req.query.period as string | undefined);
+
+    if (role !== 'ADMIN' && role !== 'TEACHER') {
+      return res.status(403).json({ error: 'Only admins and teachers can view student summaries.' });
+    }
+
+    if (role === 'TEACHER') {
+      const teacherId = await getTeacherProfileId(userId);
+
+      if (!teacherId) {
+        return res.status(404).json({ error: 'Teacher profile not found!' });
+      }
+
+      const { allowed } = await teacherHasStudentScope(teacherId, studentId);
+
+      if (!allowed) {
+        return res.status(403).json({
+          error: 'You can only view summaries for students in your own scope.',
+        });
+      }
+    }
 
     const student = await prisma.student.findUnique({
       where: { id: studentId },
       include: {
-        user: true,
+        user: {
+  select: publicUserSelect,
+},
         class: true,
         grades: {
           where: { period },
@@ -400,27 +1554,51 @@ app.get('/api/student-summary/:studentId', authenticateToken, async (req: Reques
 
 app.get('/api/student-bulletin/:studentId', authenticateToken, async (req: Request, res: Response): Promise<any> => {
   try {
+    const userId = (req as any).user.userId;
+    const role = (req as any).user.role;
     const studentId = req.params.studentId as string;
     const period = parseGradePeriod(req.query.period as string | undefined);
 
+    if (role !== 'ADMIN' && role !== 'TEACHER') {
+      return res.status(403).json({ error: 'Only admins and teachers can view bulletins.' });
+    }
+
+    if (role === 'TEACHER') {
+      const teacherId = await getTeacherProfileId(userId);
+
+      if (!teacherId) {
+        return res.status(404).json({ error: 'Teacher profile not found!' });
+      }
+
+      const { allowed } = await teacherHasStudentScope(teacherId, studentId);
+
+      if (!allowed) {
+        return res.status(403).json({
+          error: 'You can only view bulletins for students in your own scope.',
+        });
+      }
+    }
+
     const student = await prisma.student.findUnique({
-      where: { id: studentId },
+  where: { id: studentId },
+  include: {
+    user: {
+      select: publicUserSelect,
+    },
+    class: true,
+    grades: {
+      where: { period },
+      include: { subject: true },
+      orderBy: { createdAt: 'desc' },
+    },
+    attendances: {
       include: {
-        user: true,
-        class: true,
-        grades: {
-          where: { period },
-          include: { subject: true },
-          orderBy: { createdAt: 'desc' },
-        },
-        attendances: {
-          include: {
-            schedule: { include: { subject: true } },
-          },
-          orderBy: { date: 'desc' },
-        },
+        schedule: { include: { subject: true } },
       },
-    });
+      orderBy: { date: 'desc' },
+    },
+  },
+});
 
     if (!student) {
       return res.status(404).json({ error: 'Student not found!' });
@@ -516,6 +1694,1692 @@ app.get('/api/student-bulletin/:studentId', authenticateToken, async (req: Reque
   }
 });
 
+// REPORTS
+app.get('/api/reports/attendance', authenticateToken, async (req: Request, res: Response): Promise<any> => {
+  try {
+    const role = (req as any).user.role;
+
+    if (role !== 'ADMIN') {
+      return res.status(403).json({ error: 'Only admins can access attendance reports.' });
+    }
+
+    const classId = req.query.classId as string | undefined;
+    const from = req.query.from as string | undefined;
+    const to = req.query.to as string | undefined;
+
+    if (!classId || !from || !to) {
+      return res.status(400).json({
+        error: 'classId, from and to are required.',
+      });
+    }
+
+    const fromDate = new Date(from);
+    fromDate.setHours(0, 0, 0, 0);
+
+    const toDate = new Date(to);
+    toDate.setHours(23, 59, 59, 999);
+
+    if (Number.isNaN(fromDate.getTime()) || Number.isNaN(toDate.getTime())) {
+      return res.status(400).json({
+        error: 'from and to must be valid dates.',
+      });
+    }
+
+    const selectedClass = await prisma.class.findUnique({
+      where: { id: classId },
+      include: {
+        students: {
+          include: {
+            user: {
+              select: {
+                firstName: true,
+                lastName: true,
+                email: true,
+              },
+            },
+          },
+          orderBy: {
+            user: {
+              firstName: 'asc',
+            },
+          },
+        },
+      },
+    });
+
+    if (!selectedClass) {
+      return res.status(404).json({ error: 'Class not found.' });
+    }
+
+    const attendances = await prisma.attendance.findMany({
+      where: {
+        date: {
+          gte: fromDate,
+          lte: toDate,
+        },
+        schedule: {
+          classId,
+        },
+      },
+      include: {
+        student: {
+  include: {
+    user: {
+      select: publicUserSelect,
+    },
+  },
+},
+        schedule: {
+          include: {
+            subject: true,
+            class: true,
+          },
+        },
+      },
+      orderBy: [
+        { date: 'asc' },
+      ],
+    });
+
+    const rowsByStudent = new Map<
+      string,
+      {
+        studentId: string;
+        studentName: string;
+        email: string;
+        present: number;
+        absent: number;
+        late: number;
+        total: number;
+        absenceRate: number;
+      }
+    >();
+
+    for (const student of selectedClass.students) {
+      rowsByStudent.set(student.id, {
+        studentId: student.id,
+        studentName: `${student.user.firstName} ${student.user.lastName}`,
+        email: student.user.email,
+        present: 0,
+        absent: 0,
+        late: 0,
+        total: 0,
+        absenceRate: 0,
+      });
+    }
+
+    for (const attendance of attendances) {
+      const row = rowsByStudent.get(attendance.studentId);
+
+      if (!row) continue;
+
+      row.total += 1;
+
+      if (attendance.status === 'PRESENT') row.present += 1;
+      else if (attendance.status === 'ABSENT') row.absent += 1;
+      else if (attendance.status === 'LATE') row.late += 1;
+    }
+
+    const rows = Array.from(rowsByStudent.values()).map((row) => ({
+      ...row,
+      absenceRate:
+        row.total > 0 ? Math.round((row.absent / row.total) * 100) : 0,
+    }));
+
+    res.json({
+      class: {
+        id: selectedClass.id,
+        name: selectedClass.name,
+        academicYear: selectedClass.academicYear,
+      },
+      from,
+      to,
+      rows,
+      summary: {
+        students: rows.length,
+        totalPresent: rows.reduce((sum, row) => sum + row.present, 0),
+        totalAbsent: rows.reduce((sum, row) => sum + row.absent, 0),
+        totalLate: rows.reduce((sum, row) => sum + row.late, 0),
+        totalRecords: rows.reduce((sum, row) => sum + row.total, 0),
+      },
+    });
+  } catch (error) {
+    console.error('GET /api/reports/attendance error:', error);
+    res.status(500).json({ error: 'Failed to generate attendance report.' });
+  }
+});
+
+// REPORTS - GRADES
+app.get('/api/reports/grades', authenticateToken, async (req: Request, res: Response): Promise<any> => {
+  try {
+    const role = (req as any).user.role;
+
+    if (role !== 'ADMIN') {
+      return res.status(403).json({ error: 'Only admins can access grades reports.' });
+    }
+
+    const classId = req.query.classId as string | undefined;
+    const subjectId = req.query.subjectId as string | undefined;
+    const period = parseGradePeriod(req.query.period as string | undefined);
+
+    if (!classId) {
+      return res.status(400).json({
+        error: 'classId is required.',
+      });
+    }
+
+    const selectedClass = await prisma.class.findUnique({
+      where: { id: classId },
+      include: {
+        students: {
+          include: {
+            user: {
+              select: {
+                firstName: true,
+                lastName: true,
+                email: true,
+              },
+            },
+            grades: {
+              where: {
+                period,
+                ...(subjectId ? { subjectId } : {}),
+              },
+              include: {
+                subject: true,
+              },
+            },
+          },
+          orderBy: {
+            user: {
+              firstName: 'asc',
+            },
+          },
+        },
+      },
+    });
+
+    if (!selectedClass) {
+      return res.status(404).json({ error: 'Class not found.' });
+    }
+
+    const rows = selectedClass.students.map((student) => {
+      const scores = student.grades.map((grade) => grade.score);
+
+      const average =
+        scores.length > 0
+          ? scores.reduce((sum, score) => sum + score, 0) / scores.length
+          : null;
+
+      const bestScore = scores.length > 0 ? Math.max(...scores) : null;
+      const lowestScore = scores.length > 0 ? Math.min(...scores) : null;
+
+      return {
+        studentId: student.id,
+        studentName: `${student.user.firstName} ${student.user.lastName}`,
+        email: student.user.email,
+        gradesCount: student.grades.length,
+        average,
+        bestScore,
+        lowestScore,
+      };
+    });
+
+    const averages = rows
+      .map((row) => row.average)
+      .filter((value): value is number => value !== null);
+
+    const classAverage =
+      averages.length > 0
+        ? averages.reduce((sum, value) => sum + value, 0) / averages.length
+        : null;
+
+    res.json({
+      class: {
+        id: selectedClass.id,
+        name: selectedClass.name,
+        academicYear: selectedClass.academicYear,
+      },
+      subjectId: subjectId || null,
+      period,
+      rows,
+      summary: {
+        students: rows.length,
+        gradedStudents: rows.filter((row) => row.gradesCount > 0).length,
+        totalGrades: rows.reduce((sum, row) => sum + row.gradesCount, 0),
+        classAverage,
+      },
+    });
+  } catch (error) {
+    console.error('GET /api/reports/grades error:', error);
+    res.status(500).json({ error: 'Failed to generate grades report.' });
+  }
+});
+
+// ASSIGNMENTS
+app.get('/api/assignments', authenticateToken, async (req: Request, res: Response): Promise<any> => {
+  try {
+    if (!isAdminOrTeacher(req)) {
+      return res.status(403).json({ error: 'Only admins and teachers can view assignments.' });
+    }
+
+    const userId = (req as any).user.userId;
+    const role = (req as any).user.role;
+    const classId = req.query.classId as string | undefined;
+    const subjectId = req.query.subjectId as string | undefined;
+
+    let teacherIdFilter: string | undefined;
+
+    if (role === 'TEACHER') {
+      const teacherId = await getTeacherProfileId(userId);
+
+      if (!teacherId) {
+        return res.status(404).json({ error: 'Teacher profile not found!' });
+      }
+
+      teacherIdFilter = teacherId;
+    }
+
+    const assignments = await prisma.assignment.findMany({
+      where: {
+        ...(classId ? { classId } : {}),
+        ...(subjectId ? { subjectId } : {}),
+        ...(teacherIdFilter ? { teacherId: teacherIdFilter } : {}),
+      },
+      include: {
+        class: true,
+        subject: true,
+        teacher: {
+  include: {
+    user: {
+      select: publicUserSelect,
+    },
+  },
+},
+        _count: { select: { submissions: true } },
+      },
+      orderBy: { dueDate: 'asc' },
+    });
+
+    res.json(assignments);
+  } catch (error) {
+    console.error('GET /api/assignments error:', error);
+    res.status(500).json({ error: 'Failed to fetch assignments' });
+  }
+});
+
+app.post('/api/assignments', authenticateToken, async (req: Request, res: Response): Promise<any> => {
+  try {
+    if (!isAdminOrTeacher(req)) {
+      return res.status(403).json({ error: 'Only admins and teachers can create assignments.' });
+    }
+
+    const userId = (req as any).user.userId;
+    const role = (req as any).user.role;
+    const { classId, subjectId, teacherId, title, description, dueDate } = req.body;
+
+    if (!classId || !subjectId || !title || !dueDate) {
+      return res.status(400).json({ error: 'classId, subjectId, title and dueDate are required!' });
+    }
+
+    const parsedDueDate = new Date(String(dueDate));
+
+    if (Number.isNaN(parsedDueDate.getTime())) {
+      return res.status(400).json({ error: 'dueDate must be a valid date!' });
+    }
+
+    let resolvedTeacherId: string | null = teacherId || null;
+
+    if (role === 'TEACHER') {
+      const teacherIdFromToken = await getTeacherProfileId(userId);
+
+      if (!teacherIdFromToken) {
+        return res.status(404).json({ error: 'Teacher profile not found!' });
+      }
+
+      const ownsScope = await prisma.schedule.findFirst({
+        where: {
+          teacherId: teacherIdFromToken,
+          classId,
+          subjectId,
+        },
+        select: { id: true },
+      });
+
+      if (!ownsScope) {
+        return res.status(403).json({
+          error: 'You can only create assignments for your own classes and subjects.',
+        });
+      }
+
+      resolvedTeacherId = teacherIdFromToken;
+    }
+
+    const created = await prisma.assignment.create({
+      data: {
+        classId,
+        subjectId,
+        teacherId: resolvedTeacherId,
+        title: String(title).trim(),
+        description: description ? String(description).trim() : null,
+        dueDate: parsedDueDate,
+      },
+      include: {
+        class: true,
+        subject: true,
+        teacher: { include: { user: {
+  select: publicUserSelect,
+} } },
+      },
+    });
+
+    const students = await prisma.student.findMany({
+      where: { classId },
+      select: { id: true },
+    });
+
+    if (students.length > 0) {
+      await prisma.assignmentSubmission.createMany({
+        data: students.map((student) => ({
+          assignmentId: created.id,
+          studentId: student.id,
+          status: 'PENDING',
+        })),
+      });
+    }
+
+    const studentProfiles = await prisma.student.findMany({
+      where: { classId },
+      include: {
+        user: {
+  select: publicUserSelect,
+},
+        parent: {
+          include: {
+            user: {
+  select: publicUserSelect,
+},
+          },
+        },
+      },
+    });
+
+    const notificationUserIds = [
+      ...studentProfiles.map((student) => student.userId),
+      ...studentProfiles
+        .map((student) => student.parent?.userId)
+        .filter(Boolean) as string[],
+    ];
+
+    await createNotificationsForUserIds(
+      notificationUserIds,
+      'New assignment',
+      `${String(title).trim()} has been assigned with due date ${parsedDueDate.toLocaleString()}.`,
+      'ASSIGNMENT',
+      created.id
+    );
+
+    res.status(201).json(created);
+  } catch (error) {
+    console.error('POST /api/assignments error:', error);
+    res.status(500).json({ error: 'Failed to create assignment' });
+  }
+});
+
+app.put('/api/assignments/:id', authenticateToken, async (req: Request, res: Response): Promise<any> => {
+  try {
+    if (!isAdminOrTeacher(req)) {
+      return res.status(403).json({ error: 'Only admins and teachers can update assignments.' });
+    }
+
+    const userId = (req as any).user.userId;
+    const role = (req as any).user.role;
+    const assignmentId = req.params.id as string;
+    const { title, description, dueDate } = req.body;
+
+    const existing = await prisma.assignment.findUnique({
+      where: { id: assignmentId },
+      select: {
+        id: true,
+        teacherId: true,
+      },
+    });
+
+    if (!existing) {
+      return res.status(404).json({ error: 'Assignment not found!' });
+    }
+
+    if (role === 'TEACHER') {
+      const teacherId = await getTeacherProfileId(userId);
+
+      if (!teacherId) {
+        return res.status(404).json({ error: 'Teacher profile not found!' });
+      }
+
+      if (existing.teacherId !== teacherId) {
+        return res.status(403).json({
+          error: 'You can only update your own assignments.',
+        });
+      }
+    }
+
+    let parsedDueDate: Date | undefined = undefined;
+
+    if (dueDate !== undefined && dueDate !== null && dueDate !== '') {
+      parsedDueDate = new Date(String(dueDate));
+
+      if (Number.isNaN(parsedDueDate.getTime())) {
+        return res.status(400).json({ error: 'dueDate must be a valid date!' });
+      }
+    }
+
+    const updated = await prisma.assignment.update({
+      where: { id: assignmentId },
+      data: {
+        title: title !== undefined ? String(title).trim() : undefined,
+        description: description !== undefined ? (description ? String(description).trim() : null) : undefined,
+        dueDate: parsedDueDate,
+      },
+      include: {
+        class: true,
+        subject: true,
+        teacher: { include: { user: {
+  select: publicUserSelect,
+} } },
+      },
+    });
+
+    res.json(updated);
+  } catch (error) {
+    console.error('PUT /api/assignments/:id error:', error);
+    res.status(500).json({ error: 'Failed to update assignment' });
+  }
+});
+
+app.delete('/api/assignments/:id', authenticateToken, async (req: Request, res: Response): Promise<any> => {
+  try {
+    if (!isAdminOrTeacher(req)) {
+      return res.status(403).json({ error: 'Only admins and teachers can delete assignments.' });
+    }
+
+    const userId = (req as any).user.userId;
+    const role = (req as any).user.role;
+    const assignmentId = req.params.id as string;
+
+    const existing = await prisma.assignment.findUnique({
+      where: { id: assignmentId },
+      select: {
+        id: true,
+        teacherId: true,
+      },
+    });
+
+    if (!existing) {
+      return res.status(404).json({ error: 'Assignment not found!' });
+    }
+
+    if (role === 'TEACHER') {
+      const teacherId = await getTeacherProfileId(userId);
+
+      if (!teacherId) {
+        return res.status(404).json({ error: 'Teacher profile not found!' });
+      }
+
+      if (existing.teacherId !== teacherId) {
+        return res.status(403).json({
+          error: 'You can only delete your own assignments.',
+        });
+      }
+    }
+
+    await prisma.assignment.delete({
+      where: { id: assignmentId },
+    });
+
+    res.json({ message: 'Assignment deleted!' });
+  } catch (error) {
+    console.error('DELETE /api/assignments/:id error:', error);
+    res.status(500).json({ error: 'Failed to delete assignment' });
+  }
+});
+
+app.get('/api/my-assignments', authenticateToken, async (req: Request, res: Response): Promise<any> => {
+  try {
+    const userId = (req as any).user.userId;
+    const role = (req as any).user.role;
+
+    if (role === 'STUDENT') {
+      const student = await prisma.student.findUnique({
+        where: { userId },
+        include: {
+          submissions: {
+            include: {
+              assignment: {
+                include: {
+                  class: true,
+                  subject: true,
+                  teacher: { include: { user: {
+  select: publicUserSelect,
+} } },
+                },
+              },
+            },
+          },
+        },
+      });
+
+      const submissions = (student?.submissions ?? []).sort(
+        (a, b) =>
+          new Date(a.assignment.dueDate).getTime() -
+          new Date(b.assignment.dueDate).getTime()
+      );
+
+      return res.json(submissions);
+    }
+
+    if (role === 'PARENT') {
+      const parent = await prisma.parent.findUnique({
+        where: { userId },
+        include: {
+          children: {
+            include: {
+              user: {
+  select: publicUserSelect,
+},
+              submissions: {
+                include: {
+                  assignment: {
+                    include: {
+                      class: true,
+                      subject: true,
+                      teacher: { include: { user: {
+  select: publicUserSelect,
+} } },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+      });
+
+      const children = (parent?.children ?? []).map((child) => ({
+        ...child,
+        submissions: [...child.submissions].sort(
+          (a, b) =>
+            new Date(a.assignment.dueDate).getTime() -
+            new Date(b.assignment.dueDate).getTime()
+        ),
+      }));
+
+      return res.json(children);
+    }
+
+    return res.status(403).json({ error: 'Only students and parents can view assignments.' });
+  } catch (error) {
+    console.error('GET /api/my-assignments error:', error);
+    res.status(500).json({ error: 'Failed to fetch assignments' });
+  }
+});
+
+app.put('/api/assignment-submissions/:id', authenticateToken, async (req: Request, res: Response): Promise<any> => {
+  try {
+    const userId = (req as any).user.userId;
+    const role = (req as any).user.role;
+    const submissionId = req.params.id as string;
+    const { status, notes } = req.body;
+
+    const submission = await prisma.assignmentSubmission.findUnique({
+      where: { id: submissionId },
+      include: {
+        student: true,
+        assignment: {
+          include: {
+            class: true,
+            subject: true,
+          },
+        },
+      },
+    });
+
+    if (!submission) {
+      return res.status(404).json({ error: 'Assignment submission not found!' });
+    }
+
+    if (role === 'STUDENT') {
+      const student = await prisma.student.findUnique({
+        where: { userId },
+      });
+
+      if (!student || student.id !== submission.studentId) {
+        return res.status(403).json({ error: 'You can only update your own assignments.' });
+      }
+    } else if (role === 'PARENT') {
+      const parent = await prisma.parent.findUnique({
+        where: { userId },
+      });
+
+      if (!parent || submission.student.parentId !== parent.id) {
+        return res.status(403).json({ error: 'You can only update your child assignments.' });
+      }
+    } else {
+      return res.status(403).json({ error: 'Only students and parents can update assignment submissions.' });
+    }
+
+    const normalizedStatus = parseAssignmentStatus(status);
+    const normalizedNotes =
+      notes === undefined || notes === null ? null : String(notes).trim();
+
+    const updated = await prisma.assignmentSubmission.update({
+      where: { id: submissionId },
+      data: {
+        status: normalizedStatus,
+        notes: normalizedNotes || null,
+        submittedAt: normalizedStatus === 'DONE' ? new Date() : null,
+      },
+      include: {
+        assignment: {
+          include: {
+            subject: true,
+            class: true,
+          },
+        },
+        student: {
+          include: {
+            user: {
+  select: publicUserSelect,
+},
+          },
+        },
+      },
+    });
+
+    res.json(updated);
+  } catch (error) {
+    console.error('PUT /api/assignment-submissions/:id error:', error);
+    res.status(500).json({ error: 'Failed to update assignment submission' });
+  }
+});
+
+// ANNOUNCEMENTS
+app.get('/api/announcements', authenticateToken, async (req: Request, res: Response): Promise<any> => {
+  try {
+    if (!isAdminOrTeacher(req)) {
+      return res.status(403).json({ error: 'Only admins and teachers can view announcements.' });
+    }
+
+    const userId = (req as any).user.userId;
+    const role = (req as any).user.role;
+
+    let whereClause: any = undefined;
+
+    if (role === 'TEACHER') {
+      const teacherId = await getTeacherProfileId(userId);
+
+      if (!teacherId) {
+        return res.status(404).json({ error: 'Teacher profile not found!' });
+      }
+
+      const classIds = await getTeacherClassIds(teacherId);
+
+      whereClause = {
+        OR: [
+          { audience: AnnouncementAudience.ALL },
+          { audience: AnnouncementAudience.TEACHERS },
+          ...(classIds.length > 0
+            ? [{ audience: AnnouncementAudience.CLASS, classId: { in: classIds } }]
+            : []),
+        ],
+      };
+    }
+
+    const announcements = await prisma.announcement.findMany({
+      where: whereClause,
+      include: {
+        class: true,
+        createdBy: {
+          select: {
+            id: true,
+            firstName: true,
+            lastName: true,
+            email: true,
+            role: true,
+          },
+        },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+
+    res.json(announcements);
+  } catch (error) {
+    console.error('GET /api/announcements error:', error);
+    res.status(500).json({ error: 'Failed to fetch announcements' });
+  }
+});
+
+app.post('/api/announcements', authenticateToken, async (req: Request, res: Response): Promise<any> => {
+  try {
+    if (!isAdminOrTeacher(req)) {
+      return res.status(403).json({ error: 'Only admins and teachers can create announcements.' });
+    }
+
+    const userId = (req as any).user.userId;
+    const role = (req as any).user.role;
+
+    const normalizedTitle = String(req.body.title ?? '').trim();
+    const normalizedContent = String(req.body.content ?? '').trim();
+    const normalizedClassId =
+      req.body.classId === undefined || req.body.classId === null || req.body.classId === ''
+        ? null
+        : String(req.body.classId).trim();
+
+    if (!normalizedTitle || !normalizedContent) {
+      return res.status(400).json({ error: 'title and content are required!' });
+    }
+
+    const parsedAudience = parseAnnouncementAudience(req.body.audience);
+    const allowedAudiences = getAllowedAnnouncementAudiences(role);
+
+    if (!allowedAudiences.includes(parsedAudience)) {
+      return res.status(403).json({
+        error: 'You are not allowed to create announcements for this audience.',
+      });
+    }
+
+    if (parsedAudience === AnnouncementAudience.CLASS && !normalizedClassId) {
+      return res.status(400).json({ error: 'classId is required when audience is CLASS.' });
+    }
+
+    if (role === 'TEACHER' && parsedAudience === AnnouncementAudience.CLASS) {
+      const teacherId = await getTeacherProfileId(userId);
+
+      if (!teacherId) {
+        return res.status(404).json({ error: 'Teacher profile not found!' });
+      }
+
+      const classIds = await getTeacherClassIds(teacherId);
+
+      if (!normalizedClassId || !classIds.includes(normalizedClassId)) {
+        return res.status(403).json({
+          error: 'You can only create class announcements for your own classes.',
+        });
+      }
+    }
+
+    const created = await prisma.announcement.create({
+      data: {
+        title: normalizedTitle,
+        content: normalizedContent,
+        audience: parsedAudience,
+        classId: parsedAudience === AnnouncementAudience.CLASS ? normalizedClassId : null,
+        createdById: userId,
+      },
+      include: {
+        class: true,
+        createdBy: {
+          select: {
+            id: true,
+            firstName: true,
+            lastName: true,
+            email: true,
+            role: true,
+          },
+        },
+      },
+    });
+
+    let notificationUserIds: string[] = [];
+
+    if (parsedAudience === AnnouncementAudience.ALL) {
+      const users = await prisma.user.findMany({
+        select: { id: true },
+      });
+      notificationUserIds = users.map((user) => user.id);
+    } else if (parsedAudience === AnnouncementAudience.STUDENTS) {
+      const users = await prisma.user.findMany({
+        where: { role: 'STUDENT' },
+        select: { id: true },
+      });
+      notificationUserIds = users.map((user) => user.id);
+    } else if (parsedAudience === AnnouncementAudience.PARENTS) {
+      const users = await prisma.user.findMany({
+        where: { role: 'PARENT' },
+        select: { id: true },
+      });
+      notificationUserIds = users.map((user) => user.id);
+    } else if (parsedAudience === AnnouncementAudience.TEACHERS) {
+      const users = await prisma.user.findMany({
+        where: { role: 'TEACHER' },
+        select: { id: true },
+      });
+      notificationUserIds = users.map((user) => user.id);
+    } else if (parsedAudience === AnnouncementAudience.CLASS && normalizedClassId) {
+      const students = await prisma.student.findMany({
+        where: { classId: normalizedClassId },
+        include: {
+          parent: true,
+        },
+      });
+
+      notificationUserIds = [
+        ...students.map((student) => student.userId),
+        ...students
+          .map((student) => student.parent?.userId)
+          .filter(Boolean) as string[],
+      ];
+    }
+
+    await createNotificationsForUserIds(
+      notificationUserIds,
+      'New announcement',
+      normalizedTitle,
+      'ANNOUNCEMENT',
+      created.id
+    );
+
+    res.status(201).json(created);
+  } catch (error) {
+    console.error('POST /api/announcements error:', error);
+    res.status(500).json({ error: 'Failed to create announcement' });
+  }
+});
+
+app.put('/api/announcements/:id', authenticateToken, async (req: Request, res: Response): Promise<any> => {
+  try {
+    if (!isAdminOrTeacher(req)) {
+      return res.status(403).json({ error: 'Only admins and teachers can update announcements.' });
+    }
+
+    const role = (req as any).user.role;
+    const announcementId = req.params.id as string;
+
+    const normalizedTitle = String(req.body.title ?? '').trim();
+    const normalizedContent = String(req.body.content ?? '').trim();
+    const normalizedClassId =
+      req.body.classId === undefined || req.body.classId === null || req.body.classId === ''
+        ? null
+        : String(req.body.classId).trim();
+
+    const existing = await prisma.announcement.findUnique({
+      where: { id: announcementId },
+    });
+
+    if (!existing) {
+      return res.status(404).json({ error: 'Announcement not found!' });
+    }
+
+    if (role === 'TEACHER') {
+      return res.status(403).json({
+        error: 'Teachers cannot edit announcements from this page.',
+      });
+    }
+
+    if (!normalizedTitle || !normalizedContent) {
+      return res.status(400).json({ error: 'title and content are required!' });
+    }
+
+    const parsedAudience = parseAnnouncementAudience(req.body.audience);
+
+    if (parsedAudience === AnnouncementAudience.CLASS && !normalizedClassId) {
+      return res.status(400).json({ error: 'classId is required when audience is CLASS.' });
+    }
+
+    const updated = await prisma.announcement.update({
+      where: { id: announcementId },
+      data: {
+        title: normalizedTitle,
+        content: normalizedContent,
+        audience: parsedAudience,
+        classId: parsedAudience === AnnouncementAudience.CLASS ? normalizedClassId : null,
+      },
+      include: {
+        class: true,
+        createdBy: {
+          select: {
+            id: true,
+            firstName: true,
+            lastName: true,
+            email: true,
+            role: true,
+          },
+        },
+      },
+    });
+
+    res.json(updated);
+  } catch (error) {
+    console.error('PUT /api/announcements/:id error:', error);
+    res.status(500).json({ error: 'Failed to update announcement' });
+  }
+});
+
+app.delete('/api/announcements/:id', authenticateToken, async (req: Request, res: Response): Promise<any> => {
+  try {
+    if (!isAdminOrTeacher(req)) {
+      return res.status(403).json({ error: 'Only admins and teachers can delete announcements.' });
+    }
+
+    const role = (req as any).user.role;
+
+    if (role === 'TEACHER') {
+      return res.status(403).json({
+        error: 'Teachers cannot delete announcements from this page.',
+      });
+    }
+
+    await prisma.announcement.delete({
+      where: { id: req.params.id as string },
+    });
+
+    res.json({ message: 'Announcement deleted!' });
+  } catch (error) {
+    console.error('DELETE /api/announcements/:id error:', error);
+    res.status(500).json({ error: 'Failed to delete announcement' });
+  }
+});
+
+app.get('/api/my-announcements', authenticateToken, async (req: Request, res: Response): Promise<any> => {
+  try {
+    const userId = (req as any).user.userId;
+    const role = (req as any).user.role;
+
+    if (role === 'STUDENT') {
+      const student = await prisma.student.findUnique({
+        where: { userId },
+      });
+
+      const announcements = await prisma.announcement.findMany({
+  where: {
+    OR: [
+      { audience: AnnouncementAudience.ALL },
+      { audience: AnnouncementAudience.STUDENTS },
+      ...(student?.classId
+        ? [{ audience: AnnouncementAudience.CLASS, classId: student.classId }]
+        : []),
+    ],
+  },
+  include: {
+    class: true,
+    createdBy: {
+      select: {
+        firstName: true,
+        lastName: true,
+        role: true,
+      },
+    },
+  },
+  orderBy: { createdAt: 'desc' },
+});
+
+      return res.json(announcements);
+    }
+
+    if (role === 'PARENT') {
+      const parent = await prisma.parent.findUnique({
+        where: { userId },
+        include: { children: true },
+      });
+
+      const classIds = (parent?.children ?? [])
+        .map((child) => child.classId)
+        .filter(Boolean) as string[];
+
+      const announcements = await prisma.announcement.findMany({
+  where: {
+    OR: [
+      { audience: AnnouncementAudience.ALL },
+      { audience: AnnouncementAudience.PARENTS },
+      ...(classIds.length > 0
+        ? [{ audience: AnnouncementAudience.CLASS, classId: { in: classIds } }]
+        : []),
+    ],
+  },
+  include: {
+    class: true,
+    createdBy: {
+      select: {
+        firstName: true,
+        lastName: true,
+        role: true,
+      },
+    },
+  },
+  orderBy: { createdAt: 'desc' },
+});
+
+      return res.json(announcements);
+    }
+
+    if (role === 'TEACHER') {
+  const teacherId = await getTeacherProfileId(userId);
+
+  if (!teacherId) {
+    return res.status(404).json({ error: 'Teacher profile not found!' });
+  }
+
+  const classIds = await getTeacherClassIds(teacherId);
+
+  const announcements = await prisma.announcement.findMany({
+    where: {
+      OR: [
+        { audience: AnnouncementAudience.ALL },
+        { audience: AnnouncementAudience.TEACHERS },
+        ...(classIds.length > 0
+          ? [{ audience: AnnouncementAudience.CLASS, classId: { in: classIds } }]
+          : []),
+      ],
+    },
+    include: {
+      class: true,
+      createdBy: {
+        select: {
+          firstName: true,
+          lastName: true,
+          role: true,
+        },
+      },
+    },
+    orderBy: { createdAt: 'desc' },
+  });
+
+  return res.json(announcements);
+}
+
+    return res.status(403).json({ error: 'Role not allowed for announcements.' });
+  } catch (error) {
+    console.error('GET /api/my-announcements error:', error);
+    res.status(500).json({ error: 'Failed to fetch announcements' });
+  }
+});
+
+// NOTIFICATIONS
+app.get('/api/my-notifications', authenticateToken, async (req: Request, res: Response): Promise<any> => {
+  try {
+    const userId = (req as any).user.userId;
+
+    const notifications = await prisma.notification.findMany({
+      where: { userId },
+      orderBy: { createdAt: 'desc' },
+    });
+
+    res.json(notifications);
+  } catch (error) {
+    console.error('GET /api/my-notifications error:', error);
+    res.status(500).json({ error: 'Failed to fetch notifications' });
+  }
+});
+
+app.put('/api/notifications/:id/read', authenticateToken, async (req: Request, res: Response): Promise<any> => {
+  try {
+    const userId = (req as any).user.userId;
+    const notificationId = req.params.id as string;
+
+    const notification = await prisma.notification.findUnique({
+      where: { id: notificationId },
+    });
+
+    if (!notification) {
+      return res.status(404).json({ error: 'Notification not found!' });
+    }
+
+    if (notification.userId !== userId) {
+      return res.status(403).json({ error: 'You can only update your own notifications.' });
+    }
+
+    const updated = await prisma.notification.update({
+      where: { id: notificationId },
+      data: { isRead: true },
+    });
+
+    res.json(updated);
+  } catch (error) {
+    console.error('PUT /api/notifications/:id/read error:', error);
+    res.status(500).json({ error: 'Failed to update notification' });
+  }
+});
+
+app.post('/api/notify-bulletin/:studentId', authenticateToken, async (req: Request, res: Response): Promise<any> => {
+  try {
+    if (!isAdminOrTeacher(req)) {
+      return res.status(403).json({ error: 'Only admins and teachers can publish bulletin notifications.' });
+    }
+
+    const userId = (req as any).user.userId;
+    const role = (req as any).user.role;
+    const studentId = req.params.studentId as string;
+    const period = parseGradePeriod(req.body?.period);
+
+    if (role === 'TEACHER') {
+      const teacherId = await getTeacherProfileId(userId);
+
+      if (!teacherId) {
+        return res.status(404).json({ error: 'Teacher profile not found!' });
+      }
+
+      const { allowed } = await teacherHasStudentScope(teacherId, studentId);
+
+      if (!allowed) {
+        return res.status(403).json({
+          error: 'You can only notify bulletins for students in your own scope.',
+        });
+      }
+    }
+
+    const student = await prisma.student.findUnique({
+      where: { id: studentId },
+      include: {
+        user: {
+  select: publicUserSelect,
+},
+        parent: true,
+      },
+    });
+
+    if (!student) {
+      return res.status(404).json({ error: 'Student not found!' });
+    }
+
+    const notificationUserIds = [
+      student.userId,
+      student.parent?.userId,
+    ].filter(Boolean) as string[];
+
+    await createNotificationsForUserIds(
+      notificationUserIds,
+      'Bulletin available',
+      `Your ${period} bulletin is now available.`,
+      'BULLETIN',
+      studentId
+    );
+
+    res.json({ message: 'Bulletin notification sent!' });
+  } catch (error) {
+    console.error('POST /api/notify-bulletin/:studentId error:', error);
+    res.status(500).json({ error: 'Failed to send bulletin notification' });
+  }
+});
+
+app.get('/api/my-teacher-overview', authenticateToken, async (req: Request, res: Response): Promise<any> => {
+  try {
+    const userId = (req as any).user.userId;
+    const role = (req as any).user.role;
+
+    if (role !== 'TEACHER') {
+      return res.status(403).json({ error: 'Only teachers can access this overview.' });
+    }
+
+    const teacher = await prisma.teacher.findUnique({
+      where: { userId },
+      include: {
+        user: {
+          select: {
+            id: true,
+            firstName: true,
+            lastName: true,
+            email: true,
+            role: true,
+          },
+        },
+        schedules: {
+          include: {
+            class: true,
+            subject: true,
+          },
+          orderBy: [
+            { dayOfWeek: 'asc' },
+            { startTime: 'asc' },
+          ],
+        },
+        assignments: {
+          include: {
+            class: true,
+            subject: true,
+            _count: { select: { submissions: true } },
+          },
+          orderBy: { dueDate: 'asc' },
+        },
+      },
+    });
+
+    if (!teacher) {
+      return res.status(404).json({ error: 'Teacher profile not found!' });
+    }
+
+    const teacherClassIds = uniqueStringValues(
+  teacher.schedules.map((schedule) => schedule.classId)
+);
+
+const announcements = await prisma.announcement.findMany({
+  where: {
+    OR: [
+      { audience: AnnouncementAudience.ALL },
+      { audience: AnnouncementAudience.TEACHERS },
+      ...(teacherClassIds.length > 0
+        ? [{ audience: AnnouncementAudience.CLASS, classId: { in: teacherClassIds } }]
+        : []),
+    ],
+  },
+  include: {
+    class: true,
+    createdBy: {
+      select: {
+        firstName: true,
+        lastName: true,
+        role: true,
+      },
+    },
+  },
+  orderBy: { createdAt: 'desc' },
+  take: 10,
+});
+
+    const notifications = await prisma.notification.findMany({
+      where: { userId },
+      orderBy: { createdAt: 'desc' },
+      take: 10,
+    });
+
+    res.json({
+      teacher: {
+        id: teacher.id,
+        specialty: teacher.specialty,
+        hireDate: teacher.hireDate,
+        user: teacher.user,
+      },
+      schedules: teacher.schedules,
+      assignments: teacher.assignments,
+      announcements,
+      notifications,
+    });
+  } catch (error) {
+    console.error('GET /api/my-teacher-overview error:', error);
+    res.status(500).json({ error: 'Failed to fetch teacher overview' });
+  }
+});
+
+// MESSAGES
+app.get('/api/messages/recipients', authenticateToken, async (req: Request, res: Response): Promise<any> => {
+  try {
+    const userId = (req as any).user.userId;
+    const role = (req as any).user.role;
+
+    const recipients = await getAllowedMessageRecipients(userId, role);
+
+    res.json(recipients);
+  } catch (error) {
+    console.error('GET /api/messages/recipients error:', error);
+    res.status(500).json({ error: 'Failed to fetch message recipients.' });
+  }
+});
+
+app.get('/api/messages/conversations', authenticateToken, async (req: Request, res: Response): Promise<any> => {
+  try {
+    const userId = (req as any).user.userId;
+
+    const conversations = await prisma.conversation.findMany({
+      where: {
+        participants: {
+          some: {
+            userId,
+          },
+        },
+      },
+      include: {
+        participants: {
+          include: {
+            user: {
+              select: messageUserSelect,
+            },
+          },
+        },
+        messages: {
+          include: {
+            sender: {
+              select: messageUserSelect,
+            },
+          },
+          orderBy: {
+            createdAt: 'desc',
+          },
+          take: 1,
+        },
+      },
+      orderBy: {
+        updatedAt: 'desc',
+      },
+    });
+
+    const conversationsWithUnread = await Promise.all(
+      conversations.map(async (conversation) => {
+        const currentParticipant = conversation.participants.find(
+          (participant) => participant.userId === userId
+        );
+
+        const unreadCount = await prisma.message.count({
+          where: {
+            conversationId: conversation.id,
+            senderId: {
+              not: userId,
+            },
+            ...(currentParticipant?.lastReadAt
+              ? {
+                  createdAt: {
+                    gt: currentParticipant.lastReadAt,
+                  },
+                }
+              : {}),
+          },
+        });
+
+        const { messages, ...conversationWithoutMessages } = conversation;
+
+        return {
+          ...conversationWithoutMessages,
+          lastMessage: messages[0] ?? null,
+          unreadCount,
+        };
+      })
+    );
+
+    res.json(conversationsWithUnread);
+  } catch (error) {
+    console.error('GET /api/messages/conversations error:', error);
+    res.status(500).json({ error: 'Failed to fetch conversations.' });
+  }
+});
+
+app.get('/api/messages/conversations/:id', authenticateToken, async (req: Request, res: Response): Promise<any> => {
+  try {
+    const userId = (req as any).user.userId;
+    const conversationId = req.params.id as string;
+
+    const conversation = await prisma.conversation.findFirst({
+      where: {
+        id: conversationId,
+        participants: {
+          some: {
+            userId,
+          },
+        },
+      },
+      include: {
+        participants: {
+          include: {
+            user: {
+              select: messageUserSelect,
+            },
+          },
+        },
+        messages: {
+          include: {
+            sender: {
+              select: messageUserSelect,
+            },
+          },
+          orderBy: {
+            createdAt: 'asc',
+          },
+        },
+      },
+    });
+
+    if (!conversation) {
+      return res.status(404).json({ error: 'Conversation not found.' });
+    }
+
+    await prisma.conversationParticipant.updateMany({
+      where: {
+        conversationId,
+        userId,
+      },
+      data: {
+        lastReadAt: new Date(),
+      },
+    });
+
+    res.json(conversation);
+  } catch (error) {
+    console.error('GET /api/messages/conversations/:id error:', error);
+    res.status(500).json({ error: 'Failed to fetch conversation.' });
+  }
+});
+
+app.post('/api/messages/conversations', authenticateToken, async (req: Request, res: Response): Promise<any> => {
+  try {
+    const userId = (req as any).user.userId;
+    const role = (req as any).user.role;
+    const { title, participantIds, message } = req.body;
+
+    const cleanParticipantIds = Array.isArray(participantIds)
+      ? uniqueStringValues(
+          participantIds.filter((participantId) => typeof participantId === 'string')
+        ).filter((participantId) => participantId !== userId)
+      : [];
+
+    const cleanMessage =
+      typeof message === 'string' && message.trim()
+        ? message.trim()
+        : '';
+
+    if (cleanParticipantIds.length === 0) {
+      return res.status(400).json({ error: 'At least one participant is required.' });
+    }
+
+    const allowedRecipients = await getAllowedMessageRecipients(userId, role);
+    const allowedRecipientIds = new Set(allowedRecipients.map((user) => user.id));
+
+    const forbiddenParticipantIds = cleanParticipantIds.filter(
+      (participantId) => !allowedRecipientIds.has(participantId)
+    );
+
+    if (forbiddenParticipantIds.length > 0) {
+      return res.status(403).json({
+        error: 'You are not allowed to start a conversation with one or more selected users.',
+      });
+    }
+
+    const allParticipantIds = uniqueStringValues([userId, ...cleanParticipantIds]);
+    const now = new Date();
+
+    const createdConversation = await prisma.conversation.create({
+      data: {
+        title:
+          typeof title === 'string' && title.trim()
+            ? title.trim()
+            : null,
+        participants: {
+          create: allParticipantIds.map((participantId) => ({
+            userId: participantId,
+            lastReadAt: participantId === userId ? now : null,
+          })),
+        },
+      },
+    });
+
+    let createdMessage = null;
+
+    if (cleanMessage) {
+      createdMessage = await prisma.message.create({
+        data: {
+          conversationId: createdConversation.id,
+          senderId: userId,
+          body: cleanMessage,
+        },
+      });
+
+      await prisma.conversation.update({
+        where: {
+          id: createdConversation.id,
+        },
+        data: {
+          updatedAt: new Date(),
+        },
+      });
+
+      await createNotificationsForUserIds(
+        cleanParticipantIds,
+        'New message',
+        cleanMessage.length > 120 ? `${cleanMessage.slice(0, 120)}...` : cleanMessage,
+        'MESSAGE',
+        createdConversation.id
+      );
+    }
+
+    const fullConversation = await prisma.conversation.findUnique({
+      where: {
+        id: createdConversation.id,
+      },
+      include: {
+        participants: {
+          include: {
+            user: {
+              select: messageUserSelect,
+            },
+          },
+        },
+        messages: {
+          include: {
+            sender: {
+              select: messageUserSelect,
+            },
+          },
+          orderBy: {
+            createdAt: 'asc',
+          },
+        },
+      },
+    });
+
+    res.status(201).json({
+      conversation: fullConversation,
+      message: createdMessage,
+    });
+  } catch (error) {
+    console.error('POST /api/messages/conversations error:', error);
+    res.status(500).json({ error: 'Failed to create conversation.' });
+  }
+});
+
+app.post('/api/messages/conversations/:id/messages', authenticateToken, async (req: Request, res: Response): Promise<any> => {
+  try {
+    const userId = (req as any).user.userId;
+    const conversationId = req.params.id as string;
+    const { body } = req.body;
+
+    const cleanBody =
+      typeof body === 'string' && body.trim()
+        ? body.trim()
+        : '';
+
+    if (!cleanBody) {
+      return res.status(400).json({ error: 'Message body is required.' });
+    }
+
+    const conversation = await prisma.conversation.findFirst({
+      where: {
+        id: conversationId,
+        participants: {
+          some: {
+            userId,
+          },
+        },
+      },
+      include: {
+        participants: true,
+      },
+    });
+
+    if (!conversation) {
+      return res.status(404).json({ error: 'Conversation not found.' });
+    }
+
+    const createdMessage = await prisma.message.create({
+      data: {
+        conversationId,
+        senderId: userId,
+        body: cleanBody,
+      },
+      include: {
+        sender: {
+          select: messageUserSelect,
+        },
+      },
+    });
+
+    await prisma.conversation.update({
+      where: {
+        id: conversationId,
+      },
+      data: {
+        updatedAt: new Date(),
+      },
+    });
+
+    await prisma.conversationParticipant.updateMany({
+      where: {
+        conversationId,
+        userId,
+      },
+      data: {
+        lastReadAt: new Date(),
+      },
+    });
+
+    const recipientUserIds = conversation.participants
+      .map((participant) => participant.userId)
+      .filter((participantUserId) => participantUserId !== userId);
+
+    await createNotificationsForUserIds(
+      recipientUserIds,
+      'New message',
+      cleanBody.length > 120 ? `${cleanBody.slice(0, 120)}...` : cleanBody,
+      'MESSAGE',
+      conversationId
+    );
+
+    res.status(201).json(createdMessage);
+  } catch (error) {
+    console.error('POST /api/messages/conversations/:id/messages error:', error);
+    res.status(500).json({ error: 'Failed to send message.' });
+  }
+});
+
+app.put('/api/messages/conversations/:id/read', authenticateToken, async (req: Request, res: Response): Promise<any> => {
+  try {
+    const userId = (req as any).user.userId;
+    const conversationId = req.params.id as string;
+
+    const participant = await prisma.conversationParticipant.findFirst({
+      where: {
+        conversationId,
+        userId,
+      },
+    });
+
+    if (!participant) {
+      return res.status(404).json({ error: 'Conversation not found.' });
+    }
+
+    const updatedParticipant = await prisma.conversationParticipant.update({
+      where: {
+        id: participant.id,
+      },
+      data: {
+        lastReadAt: new Date(),
+      },
+    });
+
+    res.json({
+      message: 'Conversation marked as read.',
+      participant: updatedParticipant,
+    });
+  } catch (error) {
+    console.error('PUT /api/messages/conversations/:id/read error:', error);
+    res.status(500).json({ error: 'Failed to mark conversation as read.' });
+  }
+});
+
 // --- NEW MAGIC: THE STUDENT/PARENT PORTAL ---
 app.get('/api/my-portal', authenticateToken, async (req: Request, res: Response): Promise<any> => {
   try {
@@ -525,40 +3389,85 @@ app.get('/api/my-portal', authenticateToken, async (req: Request, res: Response)
     if (role === 'STUDENT') {
       // Find the student and ALL their grades, attendance, and class schedules!
       const studentInfo = await prisma.student.findUnique({
-        where: { userId: userId },
-        include: {
-          user: true,
-          class: { include: { schedules: { include: { subject: true, teacher: { include: { user: true } } } } } },
-          grades: { include: { subject: true }, orderBy: { createdAt: 'desc' } },
-          attendances: { include: { schedule: { include: { subject: true } } }, orderBy: { date: 'desc' } }
-        }
-      });
+  where: { userId: userId },
+  include: {
+    user: {
+      select: publicUserSelect,
+    },
+    class: {
+      include: {
+        schedules: {
+          include: {
+            subject: true,
+            teacher: {
+              include: {
+                user: {
+                  select: publicUserSelect,
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+    grades: {
+      include: { subject: true },
+      orderBy: { createdAt: 'desc' },
+    },
+    attendances: {
+      include: {
+        schedule: {
+          include: { subject: true },
+        },
+      },
+      orderBy: { date: 'desc' },
+    },
+  },
+});
       return res.json(studentInfo);
     } 
     else if (role === 'PARENT') {
       // Find the parent and grab THEIR CHILD's info!
       const parentInfo = await prisma.parent.findUnique({
-        where: { userId: userId },
-        include: {
-          children: {
-            include: {
-              user: true,
-              class: {
-                include: {
-                  schedules: {
-                    include: {
-                      subject: true,
-                      teacher: { include: { user: true } }
-                    }
-                  }
-                }
+  where: { userId: userId },
+  include: {
+    children: {
+      include: {
+        user: {
+          select: publicUserSelect,
+        },
+        class: {
+          include: {
+            schedules: {
+              include: {
+                subject: true,
+                teacher: {
+                  include: {
+                    user: {
+                      select: publicUserSelect,
+                    },
+                  },
+                },
               },
-              grades: { include: { subject: true }, orderBy: { createdAt: 'desc' } },
-              attendances: { include: { schedule: { include: { subject: true } } }, orderBy: { date: 'desc' } }
-            }
-          }
-        }
-      });
+            },
+          },
+        },
+        grades: {
+          include: { subject: true },
+          orderBy: { createdAt: 'desc' },
+        },
+        attendances: {
+          include: {
+            schedule: {
+              include: { subject: true },
+            },
+          },
+          orderBy: { date: 'desc' },
+        },
+      },
+    },
+  },
+});
       return res.json(parentInfo);
     }
     
@@ -567,5 +3476,137 @@ app.get('/api/my-portal', authenticateToken, async (req: Request, res: Response)
     res.status(500).json({ error: "Failed to fetch portal data" });
   }
 });
+
+const getOrCreateSchoolSettings = async () => {
+  const existingSettings = await prisma.schoolSettings.findFirst({
+    orderBy: {
+      createdAt: "asc",
+    },
+  });
+
+  if (existingSettings) {
+    return existingSettings;
+  }
+
+  return prisma.schoolSettings.create({
+    data: {
+      schoolName: "School ERP",
+      schoolSubtitle: "Tunisian Public School",
+      academicYear: "2025-2026",
+      defaultTrimester: "TRIMESTER_1",
+      defaultReportFrom: new Date("2026-04-01T00:00:00.000Z"),
+      defaultReportTo: new Date("2026-04-24T00:00:00.000Z"),
+    },
+  });
+};
+
+const parseNullableDateInput = (value: unknown) => {
+  if (value === undefined) return undefined;
+  if (value === null || value === "") return null;
+
+  const date = new Date(String(value));
+
+  if (Number.isNaN(date.getTime())) {
+    return "INVALID_DATE";
+  }
+
+  return date;
+};
+
+// SCHOOL SETTINGS
+app.get(
+  "/api/settings/school",
+  authenticateToken,
+  async (req: Request, res: Response): Promise<any> => {
+    try {
+      const settings = await getOrCreateSchoolSettings();
+      res.json(settings);
+    } catch (error) {
+      console.error("GET /api/settings/school error:", error);
+      res.status(500).json({ error: "Failed to fetch school settings." });
+    }
+  }
+);
+
+app.put(
+  "/api/settings/school",
+  authenticateToken,
+  async (req: Request, res: Response): Promise<any> => {
+    try {
+      const role = (req as any).user.role;
+
+      if (role !== "ADMIN") {
+        return res.status(403).json({
+          error: "Only admins can update school settings.",
+        });
+      }
+
+      const existingSettings = await getOrCreateSchoolSettings();
+
+      const {
+        schoolName,
+        schoolSubtitle,
+        academicYear,
+        defaultTrimester,
+        defaultReportFrom,
+        defaultReportTo,
+      } = req.body;
+
+      const parsedDefaultReportFrom = parseNullableDateInput(defaultReportFrom);
+      const parsedDefaultReportTo = parseNullableDateInput(defaultReportTo);
+
+      if (
+        parsedDefaultReportFrom === "INVALID_DATE" ||
+        parsedDefaultReportTo === "INVALID_DATE"
+      ) {
+        return res.status(400).json({
+          error: "defaultReportFrom and defaultReportTo must be valid dates.",
+        });
+      }
+
+      const updatedSettings = await prisma.schoolSettings.update({
+        where: {
+          id: existingSettings.id,
+        },
+        data: {
+          schoolName:
+            typeof schoolName === "string" && schoolName.trim()
+              ? schoolName.trim()
+              : existingSettings.schoolName,
+
+          schoolSubtitle:
+            typeof schoolSubtitle === "string" && schoolSubtitle.trim()
+              ? schoolSubtitle.trim()
+              : existingSettings.schoolSubtitle,
+
+          academicYear:
+            typeof academicYear === "string" && academicYear.trim()
+              ? academicYear.trim()
+              : existingSettings.academicYear,
+
+          defaultTrimester:
+            typeof defaultTrimester === "string"
+              ? parseGradePeriod(defaultTrimester)
+              : existingSettings.defaultTrimester,
+
+          defaultReportFrom:
+            parsedDefaultReportFrom === undefined
+              ? existingSettings.defaultReportFrom
+              : parsedDefaultReportFrom,
+
+          defaultReportTo:
+            parsedDefaultReportTo === undefined
+              ? existingSettings.defaultReportTo
+              : parsedDefaultReportTo,
+        },
+      });
+
+      res.json(updatedSettings);
+    } catch (error) {
+      console.error("PUT /api/settings/school error:", error);
+      res.status(500).json({ error: "Failed to update school settings." });
+    }
+  }
+);
 
 app.listen(PORT, () => console.log(`🚀 Server is running on http://localhost:${PORT}`));

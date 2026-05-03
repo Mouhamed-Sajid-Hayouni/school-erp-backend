@@ -19,6 +19,14 @@ enum GradePeriod {
   TRIMESTER_3
 }
 
+enum AnnouncementAudience {
+  ALL
+  STUDENTS
+  PARENTS
+  TEACHERS
+  CLASS
+}
+
 model User {
   id            String   @id @default(uuid())
   email         String   @unique
@@ -34,6 +42,12 @@ model User {
   studentProfile Student?
   teacherProfile Teacher?
   parentProfile  Parent?
+
+  announcementsCreated     Announcement[]
+  notifications            Notification[]
+
+  conversationParticipants ConversationParticipant[]
+  sentMessages             Message[]
 }
 
 model Student {
@@ -43,63 +57,70 @@ model Student {
   dateOfBirth    DateTime
   enrollmentDate DateTime @default(now())
   classId        String?
-  class          Class?   @relation(fields: [classId], references: [id])
+  class          Class?   @relation(fields: [classId], references: [id], onDelete: SetNull)
   parentId       String?
-  parent         Parent?  @relation(fields: [parentId], references: [id])
-  
+  parent         Parent?  @relation(fields: [parentId], references: [id], onDelete: SetNull)
+
   attendances    Attendance[]
-  grades         Grade[]      // NEW: Linked to Grades!
+  grades         Grade[]
+  submissions    AssignmentSubmission[]
 }
 
 model Teacher {
-  id         String   @id @default(uuid())
-  userId     String   @unique
-  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  specialty  String   
-  hireDate   DateTime @default(now())
+  id          String   @id @default(uuid())
+  userId      String   @unique
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  specialty   String
+  hireDate    DateTime @default(now())
 
-  schedules  Schedule[]
+  schedules   Schedule[]
+  assignments Assignment[]
 }
 
 model Parent {
-  id       String    @id @default(uuid())
-  userId   String    @unique
-  user     User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  id       String @id @default(uuid())
+  userId   String @unique
+  user     User   @relation(fields: [userId], references: [id], onDelete: Cascade)
   address  String?
-  
+
   children Student[]
 }
 
 model Class {
-  id           String    @id @default(uuid())
-  name         String    
-  academicYear String    
-  
-  students     Student[]
-  schedules    Schedule[]
+  id            String @id @default(uuid())
+  name          String
+  academicYear  String
+
+  students      Student[]
+  schedules     Schedule[]
+  assignments   Assignment[]
+  announcements Announcement[]
+
+  @@unique([name, academicYear])
 }
 
 model Subject {
-  id          String     @id @default(uuid())
-  name        String     
-  coefficient Float      @default(1.0)
-  
-  schedules   Schedule[]
-  grades      Grade[]      // NEW: Linked to Grades!
+  id           String @id @default(uuid())
+  name         String
+  coefficient  Float  @default(1.0)
+
+  schedules    Schedule[]
+  grades       Grade[]
+  assignments  Assignment[]
 }
 
 model Schedule {
-  id         String   @id @default(uuid())
-  classId    String
-  class      Class    @relation(fields: [classId], references: [id], onDelete: Cascade)
-  subjectId  String
-  subject    Subject  @relation(fields:[subjectId], references: [id], onDelete: Cascade)
-  teacherId  String
-  teacher    Teacher  @relation(fields: [teacherId], references: [id], onDelete: Cascade)
-  
-  dayOfWeek  String   
-  startTime  String   
-  endTime    String   
+  id          String  @id @default(uuid())
+  classId     String
+  class       Class   @relation(fields: [classId], references: [id], onDelete: Cascade)
+  subjectId   String
+  subject     Subject @relation(fields: [subjectId], references: [id], onDelete: Cascade)
+  teacherId   String
+  teacher     Teacher @relation(fields: [teacherId], references: [id], onDelete: Cascade)
+
+  dayOfWeek   String
+  startTime   String
+  endTime     String
 
   attendances Attendance[]
 }
@@ -110,26 +131,140 @@ model Attendance {
   student    Student  @relation(fields: [studentId], references: [id], onDelete: Cascade)
   scheduleId String
   schedule   Schedule @relation(fields: [scheduleId], references: [id], onDelete: Cascade)
-  
+
   date       DateTime @default(now())
-  status     String   
+  status     String
   remarks    String?
 }
 
-// --- NEW MAGIC: THE GRADES TABLE ---
 model Grade {
-  id          String      @id @default(uuid())
-  studentId   String
-  student     Student     @relation(fields:[studentId], references: [id], onDelete: Cascade)
-  subjectId   String
-  subject     Subject     @relation(fields: [subjectId], references: [id], onDelete: Cascade)
+  id         String      @id @default(uuid())
+  studentId  String
+  student    Student     @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  subjectId  String
+  subject    Subject     @relation(fields: [subjectId], references: [id], onDelete: Cascade)
 
-  examType    String
-  period      GradePeriod @default(TRIMESTER_1)
-  score       Float
-  comments    String?
+  examType   String
+  period     GradePeriod @default(TRIMESTER_1)
+  score      Float
+  comments   String?
 
-  createdAt   DateTime    @default(now())
+  createdAt  DateTime    @default(now())
 
   @@index([studentId, subjectId, examType, period])
+}
+
+model Assignment {
+  id           String   @id @default(uuid())
+  classId      String
+  class        Class    @relation(fields: [classId], references: [id], onDelete: Cascade)
+
+  subjectId    String
+  subject      Subject  @relation(fields: [subjectId], references: [id], onDelete: Cascade)
+
+  teacherId    String?
+  teacher      Teacher? @relation(fields: [teacherId], references: [id], onDelete: SetNull)
+
+  title        String
+  description  String?
+  dueDate      DateTime
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  submissions  AssignmentSubmission[]
+}
+
+model AssignmentSubmission {
+  id            String     @id @default(uuid())
+  assignmentId  String
+  assignment    Assignment @relation(fields: [assignmentId], references: [id], onDelete: Cascade)
+
+  studentId     String
+  student       Student    @relation(fields: [studentId], references: [id], onDelete: Cascade)
+
+  status        String     @default("PENDING")
+  submittedAt   DateTime?
+  notes         String?
+
+  @@unique([assignmentId, studentId])
+}
+
+model Announcement {
+  id          String               @id @default(uuid())
+  title       String
+  content     String
+  audience    AnnouncementAudience @default(ALL)
+
+  classId     String?
+  class       Class?               @relation(fields: [classId], references: [id], onDelete: Cascade)
+
+  createdById String?
+  createdBy   User?                @relation(fields: [createdById], references: [id], onDelete: SetNull)
+
+  createdAt   DateTime             @default(now())
+  updatedAt   DateTime             @updatedAt
+}
+
+model Notification {
+  id          String   @id @default(uuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  title       String
+  message     String
+  type        String
+  isRead      Boolean  @default(false)
+
+  relatedId   String?
+  createdAt   DateTime @default(now())
+}
+
+model SchoolSettings {
+  id                String      @id @default(uuid())
+  schoolName        String      @default("School ERP")
+  schoolSubtitle    String      @default("Tunisian Public School")
+  academicYear      String      @default("2025-2026")
+  defaultTrimester  GradePeriod @default(TRIMESTER_1)
+  defaultReportFrom DateTime?
+  defaultReportTo   DateTime?
+  createdAt         DateTime    @default(now())
+  updatedAt         DateTime    @updatedAt
+}
+
+model Conversation {
+  id           String   @id @default(uuid())
+  title        String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  participants ConversationParticipant[]
+  messages     Message[]
+}
+
+model ConversationParticipant {
+  id             String   @id @default(uuid())
+  conversationId String
+  userId         String
+  lastReadAt     DateTime?
+
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  user           User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([conversationId, userId])
+  @@index([userId])
+  @@index([conversationId])
+}
+
+model Message {
+  id             String   @id @default(uuid())
+  conversationId String
+  senderId       String
+  body           String
+  createdAt      DateTime @default(now())
+
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  sender         User         @relation(fields: [senderId], references: [id], onDelete: Cascade)
+
+  @@index([conversationId, createdAt])
+  @@index([senderId])
 }
