@@ -1,6 +1,6 @@
 import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
-import { PrismaClient, GradePeriod, AnnouncementAudience, Role } from '@prisma/client';
+import { PrismaClient, Prisma, GradePeriod, AnnouncementAudience, Role } from '@prisma/client';
 import { Pool } from 'pg';
 import { PrismaPg } from '@prisma/adapter-pg';
 import bcrypt from 'bcryptjs';
@@ -246,6 +246,49 @@ const createNotificationsForUserIds = async (
   });
 };
 
+const createAuditLog = async (
+  req: Request,
+  data: {
+    action: string;
+    entity: string;
+    entityId?: string | null;
+    details?: Prisma.InputJsonValue;
+  }
+) => {
+  try {
+    const authUser = (req as any).user;
+    const actorId = authUser?.userId ?? null;
+
+    const actor = actorId
+      ? await prisma.user.findUnique({
+          where: { id: actorId },
+          select: {
+            firstName: true,
+            lastName: true,
+            role: true,
+          },
+        })
+      : null;
+
+    await prisma.auditLog.create({
+      data: {
+        actorId,
+        actorRole: (actor?.role ?? authUser?.role ?? null) as Role | null,
+        actorName: actor
+          ? `${actor.firstName} ${actor.lastName}`.trim()
+          : authUser?.firstName ?? null,
+        action: data.action,
+        entity: data.entity,
+        entityId: data.entityId ?? null,
+        details: data.details ?? undefined,
+        ipAddress: req.ip || req.socket.remoteAddress || null,
+      },
+    });
+  } catch (error) {
+    console.error('Audit log failed:', error);
+  }
+};
+
 const publicUserSelect = {
   id: true,
   firstName: true,
@@ -453,6 +496,70 @@ app.get('/api/health', async (req: Request, res: Response): Promise<any> => {
   }
 });
 
+app.get('/api/audit-logs', authenticateToken, requireAdmin, async (req: Request, res: Response): Promise<any> => {
+  try {
+    const page = Math.max(Number(req.query.page || 1), 1);
+    const limit = Math.min(Math.max(Number(req.query.limit || 50), 1), 100);
+    const skip = (page - 1) * limit;
+
+    const action = String(req.query.action ?? '').trim();
+    const entity = String(req.query.entity ?? '').trim();
+    const actorRole = String(req.query.actorRole ?? '').trim().toUpperCase();
+
+    const where: any = {};
+
+    if (action) {
+      where.action = {
+        contains: action,
+        mode: 'insensitive',
+      };
+    }
+
+    if (entity) {
+      where.entity = {
+        contains: entity,
+        mode: 'insensitive',
+      };
+    }
+
+    if (['ADMIN', 'TEACHER', 'STUDENT', 'PARENT'].includes(actorRole)) {
+      where.actorRole = actorRole as Role;
+    }
+
+    const [logs, total] = await Promise.all([
+      prisma.auditLog.findMany({
+        where,
+        include: {
+          actor: {
+            select: {
+              id: true,
+              firstName: true,
+              lastName: true,
+              email: true,
+              role: true,
+            },
+          },
+        },
+        orderBy: { createdAt: 'desc' },
+        skip,
+        take: limit,
+      }),
+      prisma.auditLog.count({ where }),
+    ]);
+
+    res.json({
+      data: logs,
+      total,
+      page,
+      limit,
+      totalPages: Math.ceil(total / limit),
+    });
+  } catch (error) {
+    console.error('GET /api/audit-logs error:', error);
+    res.status(500).json({ error: 'Failed to fetch audit logs' });
+  }
+});
+
 app.post('/api/login', async (req: Request, res: Response): Promise<any> => {
   try {
     const normalizedEmail = String(req.body.email ?? '').trim().toLowerCase();
@@ -612,7 +719,7 @@ app.post('/api/register', authenticateToken, requireAdmin, async (req: Request, 
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(normalizedPassword, salt);
 
-    await prisma.$transaction(async (tx) => {
+    const createdUser = await prisma.$transaction(async (tx) => {
       const newUser = await tx.user.create({
         data: {
           email: normalizedEmail,
@@ -653,6 +760,20 @@ app.post('/api/register', authenticateToken, requireAdmin, async (req: Request, 
           },
         });
       }
+
+      return newUser;
+    });
+
+    await createAuditLog(req, {
+      action: 'CREATE_USER',
+      entity: 'User',
+      entityId: createdUser.id,
+      details: {
+        email: createdUser.email,
+        firstName: createdUser.firstName,
+        lastName: createdUser.lastName,
+        role: createdUser.role,
+      },
     });
 
     return res.status(201).json({ message: 'User created!' });
@@ -704,12 +825,23 @@ app.put('/api/users/:id', authenticateToken, requireAdmin, async (req: Request, 
       return res.status(400).json({ error: 'Email already in use!' });
     }
 
-    await prisma.user.update({
+    const updatedUser = await prisma.user.update({
       where: { id: userId },
       data: {
         firstName: normalizedFirstName,
         lastName: normalizedLastName,
         email: normalizedEmail,
+      },
+    });
+
+    await createAuditLog(req, {
+      action: 'UPDATE_USER',
+      entity: 'User',
+      entityId: updatedUser.id,
+      details: {
+        email: updatedUser.email,
+        firstName: updatedUser.firstName,
+        lastName: updatedUser.lastName,
       },
     });
 
@@ -721,6 +853,21 @@ app.put('/api/users/:id', authenticateToken, requireAdmin, async (req: Request, 
 app.delete('/api/users/:id', authenticateToken, requireAdmin, async (req: Request, res: Response): Promise<any> => {
   try {
     const userId = req.params.id as string;
+
+    const userToDelete = await prisma.user.findUnique({
+  where: { id: userId },
+  select: {
+    id: true,
+    email: true,
+    firstName: true,
+    lastName: true,
+    role: true,
+  },
+});
+
+if (!userToDelete) {
+  return res.status(404).json({ error: 'User not found!' });
+}
     await prisma.student.deleteMany({ where: { userId } });
     await prisma.teacher.deleteMany({ where: { userId } }); 
     const parentProfile = await prisma.parent.findUnique({ where: { userId } });
@@ -729,6 +876,18 @@ app.delete('/api/users/:id', authenticateToken, requireAdmin, async (req: Reques
       await prisma.parent.delete({ where: { id: parentProfile.id } });
     }
     await prisma.user.delete({ where: { id: userId } });
+
+    await createAuditLog(req, {
+  action: 'DELETE_USER',
+  entity: 'User',
+  entityId: userToDelete.id,
+  details: {
+    email: userToDelete.email,
+    firstName: userToDelete.firstName,
+    lastName: userToDelete.lastName,
+    role: userToDelete.role,
+  },
+});
     res.json({ message: "User deleted!" });
   } catch (error) { res.status(500).json({ error: "Failed to delete user" }); }
 });
@@ -768,13 +927,56 @@ app.post('/api/classes', authenticateToken, requireAdmin, async (req: Request, r
       },
     });
 
+    await createAuditLog(req, {
+  action: 'CREATE_CLASS',
+  entity: 'Class',
+  entityId: createdClass.id,
+  details: {
+    name: createdClass.name,
+    academicYear: createdClass.academicYear,
+  },
+});
+
     res.status(201).json(createdClass);
   } catch (error) {
     res.status(500).json({ error: 'Failed' });
   }
 });
 app.get('/api/classes/:id', authenticateToken, requireAdmin, async (req: Request, res: Response): Promise<any> => { try { res.json(await prisma.class.findUnique({ where: { id: req.params.id as string }, include: { students: { include: { user: { select: { firstName: true, lastName: true, email: true } } } } } })); } catch (error) { res.status(500).json({ error: "Failed" }); } });
-app.delete('/api/classes/:id', authenticateToken, requireAdmin, async (req: Request, res: Response): Promise<any> => { try { await prisma.class.delete({ where: { id: req.params.id as string } }); res.json({ message: "Deleted!" }); } catch (error) { res.status(500).json({ error: "Failed" }); } });
+app.delete('/api/classes/:id', authenticateToken, requireAdmin, async (req: Request, res: Response): Promise<any> => {
+  try {
+    const classId = req.params.id as string;
+
+    const classToDelete = await prisma.class.findUnique({
+      where: { id: classId },
+      select: {
+        id: true,
+        name: true,
+        academicYear: true,
+      },
+    });
+
+    if (!classToDelete) {
+      return res.status(404).json({ error: 'Class not found!' });
+    }
+
+    await prisma.class.delete({ where: { id: classId } });
+
+    await createAuditLog(req, {
+      action: 'DELETE_CLASS',
+      entity: 'Class',
+      entityId: classToDelete.id,
+      details: {
+        name: classToDelete.name,
+        academicYear: classToDelete.academicYear,
+      },
+    });
+
+    res.json({ message: "Deleted!" });
+  } catch (error) {
+    res.status(500).json({ error: "Failed" });
+  }
+});
 app.get('/api/subjects', authenticateToken, requireAdmin, async (req: Request, res: Response) => { try { res.json(await prisma.subject.findMany({ orderBy: { name: 'asc' } })); } catch (error) { res.status(500).json({ error: "Failed" }); } });
 app.post('/api/subjects', authenticateToken, requireAdmin, async (req: Request, res: Response): Promise<any> => {
   try {
@@ -821,12 +1023,55 @@ app.post('/api/subjects', authenticateToken, requireAdmin, async (req: Request, 
       },
     });
 
+    await createAuditLog(req, {
+  action: 'CREATE_SUBJECT',
+  entity: 'Subject',
+  entityId: createdSubject.id,
+  details: {
+    name: createdSubject.name,
+    coefficient: createdSubject.coefficient,
+  },
+});
+
     res.status(201).json(createdSubject);
   } catch (error) {
     res.status(500).json({ error: 'Failed' });
   }
 });
-app.delete('/api/subjects/:id', authenticateToken, requireAdmin, async (req: Request, res: Response): Promise<any> => { try { await prisma.subject.delete({ where: { id: req.params.id as string } }); res.json({ message: "Deleted!" }); } catch (error) { res.status(500).json({ error: "Failed" }); } });
+app.delete('/api/subjects/:id', authenticateToken, requireAdmin, async (req: Request, res: Response): Promise<any> => {
+  try {
+    const subjectId = req.params.id as string;
+
+    const subjectToDelete = await prisma.subject.findUnique({
+      where: { id: subjectId },
+      select: {
+        id: true,
+        name: true,
+        coefficient: true,
+      },
+    });
+
+    if (!subjectToDelete) {
+      return res.status(404).json({ error: 'Subject not found!' });
+    }
+
+    await prisma.subject.delete({ where: { id: subjectId } });
+
+    await createAuditLog(req, {
+      action: 'DELETE_SUBJECT',
+      entity: 'Subject',
+      entityId: subjectToDelete.id,
+      details: {
+        name: subjectToDelete.name,
+        coefficient: subjectToDelete.coefficient,
+      },
+    });
+
+    res.json({ message: "Deleted!" });
+  } catch (error) {
+    res.status(500).json({ error: "Failed" });
+  }
+});
 app.get('/api/teachers', authenticateToken, requireAdmin, async (req: Request, res: Response) => {
   try {
     res.json(
@@ -965,6 +1210,20 @@ if (teacherConflict) {
       }
     });
 
+    await createAuditLog(req, {
+      action: 'CREATE_SCHEDULE',
+      entity: 'Schedule',
+      entityId: createdSchedule.id,
+      details: {
+        classId,
+        subjectId,
+        teacherId,
+        dayOfWeek: normalizedDayOfWeek,
+        startTime: normalizedStartTime,
+        endTime: normalizedEndTime,
+      },
+    });
+
     res.status(201).json(createdSchedule);
   } catch (error) {
     res.status(500).json({ error: "Failed" });
@@ -1048,6 +1307,20 @@ if (teacherConflict) {
       }
     });
 
+    await createAuditLog(req, {
+      action: 'UPDATE_SCHEDULE',
+      entity: 'Schedule',
+      entityId: updatedSchedule.id,
+      details: {
+        classId,
+        subjectId,
+        teacherId,
+        dayOfWeek: normalizedDayOfWeek,
+        startTime: normalizedStartTime,
+        endTime: normalizedEndTime,
+      },
+    });
+
     res.json(updatedSchedule);
   } catch (error) {
     res.status(500).json({ error: "Failed to update schedule" });
@@ -1056,7 +1329,34 @@ if (teacherConflict) {
 
 app.delete('/api/schedules/:id', authenticateToken, requireAdmin, async (req: Request, res: Response): Promise<any> => {
   try {
-    await prisma.schedule.delete({ where: { id: req.params.id as string } });
+    const scheduleId = req.params.id as string;
+
+    const scheduleToDelete = await prisma.schedule.findUnique({
+      where: { id: scheduleId },
+      select: {
+        id: true,
+        classId: true,
+        subjectId: true,
+        teacherId: true,
+        dayOfWeek: true,
+        startTime: true,
+        endTime: true,
+      },
+    });
+
+    if (!scheduleToDelete) {
+      return res.status(404).json({ error: "Schedule not found!" });
+    }
+
+    await prisma.schedule.delete({ where: { id: scheduleId } });
+
+    await createAuditLog(req, {
+      action: 'DELETE_SCHEDULE',
+      entity: 'Schedule',
+      entityId: scheduleToDelete.id,
+      details: scheduleToDelete,
+    });
+
     res.json({ message: "Deleted!" });
   } catch (error) {
     res.status(500).json({ error: "Failed" });
@@ -1224,23 +1524,37 @@ app.post('/api/attendance', authenticateToken, async (req: Request, res: Respons
       },
     });
 
-    if (existing) {
-      await prisma.attendance.update({
-        where: { id: existing.id },
-        data: { status: normalizedStatus },
-      });
-    } else {
-      await prisma.attendance.create({
-        data: {
-          studentId,
-          scheduleId,
-          status: normalizedStatus,
-          date: targetDate,
-        },
-      });
-    }
+    let savedAttendance;
 
-    res.json({ message: 'Attendance saved!' });
+if (existing) {
+  savedAttendance = await prisma.attendance.update({
+    where: { id: existing.id },
+    data: { status: normalizedStatus },
+  });
+} else {
+  savedAttendance = await prisma.attendance.create({
+    data: {
+      studentId,
+      scheduleId,
+      status: normalizedStatus,
+      date: targetDate,
+    },
+  });
+}
+
+await createAuditLog(req, {
+  action: existing ? 'UPDATE_ATTENDANCE' : 'CREATE_ATTENDANCE',
+  entity: 'Attendance',
+  entityId: savedAttendance.id,
+  details: {
+    studentId,
+    scheduleId,
+    status: normalizedStatus,
+    date: targetDate.toISOString(),
+  },
+});
+
+res.json({ message: 'Attendance saved!' });
   } catch (error) {
     console.error('POST /api/attendance error:', error);
     res.status(500).json({ error: 'Failed' });
@@ -1413,6 +1727,19 @@ app.post('/api/grades', authenticateToken, async (req: Request, res: Response): 
       'GRADE',
       savedGrade.id
     );
+
+    await createAuditLog(req, {
+      action: existing ? 'UPDATE_GRADE' : 'CREATE_GRADE',
+      entity: 'Grade',
+      entityId: savedGrade.id,
+      details: {
+    studentId,
+    subjectId,
+    examType: normalizedExamType,
+    period: gradePeriod,
+    score: numericScore,
+  },
+});
 
     res.json({ message: 'Grade saved!', grade: savedGrade });
   } catch (error) {
@@ -2119,6 +2446,19 @@ app.post('/api/assignments', authenticateToken, async (req: Request, res: Respon
       created.id
     );
 
+    await createAuditLog(req, {
+      action: 'CREATE_ASSIGNMENT',
+      entity: 'Assignment',
+      entityId: created.id,
+      details: {
+        title: created.title,
+        classId,
+        subjectId,
+        teacherId: resolvedTeacherId,
+        dueDate: parsedDueDate.toISOString(),
+      },
+    });
+
     res.status(201).json(created);
   } catch (error) {
     console.error('POST /api/assignments error:', error);
@@ -2189,6 +2529,19 @@ app.put('/api/assignments/:id', authenticateToken, async (req: Request, res: Res
       },
     });
 
+    await createAuditLog(req, {
+      action: 'UPDATE_ASSIGNMENT',
+      entity: 'Assignment',
+      entityId: updated.id,
+      details: {
+        title: updated.title,
+        classId: updated.classId,
+        subjectId: updated.subjectId,
+        teacherId: updated.teacherId,
+        dueDate: updated.dueDate.toISOString(),
+      },
+    });
+
     res.json(updated);
   } catch (error) {
     console.error('PUT /api/assignments/:id error:', error);
@@ -2210,7 +2563,11 @@ app.delete('/api/assignments/:id', authenticateToken, async (req: Request, res: 
       where: { id: assignmentId },
       select: {
         id: true,
+        title: true,
+        classId: true,
+        subjectId: true,
         teacherId: true,
+        dueDate: true,
       },
     });
 
@@ -2234,6 +2591,19 @@ app.delete('/api/assignments/:id', authenticateToken, async (req: Request, res: 
 
     await prisma.assignment.delete({
       where: { id: assignmentId },
+    });
+
+    await createAuditLog(req, {
+      action: 'DELETE_ASSIGNMENT',
+      entity: 'Assignment',
+      entityId: existing.id,
+      details: {
+        title: existing.title,
+        classId: existing.classId,
+        subjectId: existing.subjectId,
+        teacherId: existing.teacherId,
+        dueDate: existing.dueDate.toISOString(),
+      },
     });
 
     res.json({ message: 'Assignment deleted!' });
@@ -2578,6 +2948,18 @@ app.post('/api/announcements', authenticateToken, async (req: Request, res: Resp
       created.id
     );
 
+    await createAuditLog(req, {
+      action: 'CREATE_ANNOUNCEMENT',
+      entity: 'Announcement',
+      entityId: created.id,
+      details: {
+        title: created.title,
+        audience: created.audience,
+        classId: created.classId,
+        createdById: userId,
+      },
+    });
+
     res.status(201).json(created);
   } catch (error) {
     console.error('POST /api/announcements error:', error);
@@ -2647,6 +3029,17 @@ app.put('/api/announcements/:id', authenticateToken, async (req: Request, res: R
       },
     });
 
+    await createAuditLog(req, {
+      action: 'UPDATE_ANNOUNCEMENT',
+      entity: 'Announcement',
+      entityId: updated.id,
+      details: {
+        title: updated.title,
+        audience: updated.audience,
+        classId: updated.classId,
+      },
+    });
+
     res.json(updated);
   } catch (error) {
     console.error('PUT /api/announcements/:id error:', error);
@@ -2654,27 +3047,43 @@ app.put('/api/announcements/:id', authenticateToken, async (req: Request, res: R
   }
 });
 
-app.delete('/api/announcements/:id', authenticateToken, async (req: Request, res: Response): Promise<any> => {
+app.delete('/api/announcements/:id', authenticateToken, requireAdmin, async (req: Request, res: Response): Promise<any> => {
   try {
-    if (!isAdminOrTeacher(req)) {
-      return res.status(403).json({ error: 'Only admins and teachers can delete announcements.' });
-    }
+    const announcementId = req.params.id as string;
 
-    const role = (req as any).user.role;
+    const announcementToDelete = await prisma.announcement.findUnique({
+      where: { id: announcementId },
+      select: {
+        id: true,
+        title: true,
+        audience: true,
+        classId: true,
+        createdById: true,
+      },
+    });
 
-    if (role === 'TEACHER') {
-      return res.status(403).json({
-        error: 'Teachers cannot delete announcements from this page.',
-      });
+    if (!announcementToDelete) {
+      return res.status(404).json({ error: 'Announcement not found!' });
     }
 
     await prisma.announcement.delete({
-      where: { id: req.params.id as string },
+      where: { id: announcementId },
+    });
+
+    await createAuditLog(req, {
+      action: 'DELETE_ANNOUNCEMENT',
+      entity: 'Announcement',
+      entityId: announcementToDelete.id,
+      details: {
+        title: announcementToDelete.title,
+        audience: announcementToDelete.audience,
+        classId: announcementToDelete.classId,
+        createdById: announcementToDelete.createdById,
+      },
     });
 
     res.json({ message: 'Announcement deleted!' });
   } catch (error) {
-    console.error('DELETE /api/announcements/:id error:', error);
     res.status(500).json({ error: 'Failed to delete announcement' });
   }
 });
@@ -3600,6 +4009,38 @@ app.put(
               : parsedDefaultReportTo,
         },
       });
+
+      await createAuditLog(req, {
+  action: 'UPDATE_SCHOOL_SETTINGS',
+  entity: 'SchoolSettings',
+  entityId: updatedSettings.id,
+  details: {
+    before: {
+      schoolName: existingSettings.schoolName,
+      schoolSubtitle: existingSettings.schoolSubtitle,
+      academicYear: existingSettings.academicYear,
+      defaultTrimester: existingSettings.defaultTrimester,
+      defaultReportFrom: existingSettings.defaultReportFrom
+        ? existingSettings.defaultReportFrom.toISOString()
+        : null,
+      defaultReportTo: existingSettings.defaultReportTo
+        ? existingSettings.defaultReportTo.toISOString()
+        : null,
+    },
+    after: {
+      schoolName: updatedSettings.schoolName,
+      schoolSubtitle: updatedSettings.schoolSubtitle,
+      academicYear: updatedSettings.academicYear,
+      defaultTrimester: updatedSettings.defaultTrimester,
+      defaultReportFrom: updatedSettings.defaultReportFrom
+        ? updatedSettings.defaultReportFrom.toISOString()
+        : null,
+      defaultReportTo: updatedSettings.defaultReportTo
+        ? updatedSettings.defaultReportTo.toISOString()
+        : null,
+    },
+  },
+});
 
       res.json(updatedSettings);
     } catch (error) {

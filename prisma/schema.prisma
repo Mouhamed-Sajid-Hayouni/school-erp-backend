@@ -45,6 +45,7 @@ model User {
 
   announcementsCreated     Announcement[]
   notifications            Notification[]
+  auditLogs                AuditLog[]
 
   conversationParticipants ConversationParticipant[]
   sentMessages             Message[]
@@ -267,4 +268,30 @@ model Message {
 
   @@index([conversationId, createdAt])
   @@index([senderId])
+}
+
+model AuditLog {
+  id        String   @id @default(uuid())
+
+  actorId   String?
+  actor     User?    @relation(fields: [actorId], references: [id], onDelete: SetNull)
+
+  actorRole Role?
+  actorName String?
+
+  action    String
+  entity    String
+  entityId  String?
+
+  details   Json?
+  ipAddress String?
+
+  createdAt DateTime @default(now())
+
+  @@index([actorId])
+  @@index([actorRole])
+  @@index([action])
+  @@index([entity])
+  @@index([entityId])
+  @@index([createdAt])
 }
