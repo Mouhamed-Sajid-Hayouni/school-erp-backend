@@ -34,6 +34,7 @@ model User {
   firstName     String
   lastName      String
   phone         String?
+  profileImage  String?
   role          Role     @default(STUDENT)
   isActive      Boolean  @default(true)
   createdAt     DateTime @default(now())

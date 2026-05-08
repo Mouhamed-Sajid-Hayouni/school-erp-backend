@@ -1,5 +1,8 @@
 import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
+import path from 'path';
+import fs from 'fs';
+import multer from 'multer';
 import { PrismaClient, Prisma, GradePeriod, AnnouncementAudience, Role } from '@prisma/client';
 import { Pool } from 'pg';
 import { PrismaPg } from '@prisma/adapter-pg';
@@ -30,6 +33,38 @@ const prisma = new PrismaClient({ adapter });
 
 const app = express();
 
+const uploadsDir = path.join(process.cwd(), 'uploads');
+
+if (!fs.existsSync(uploadsDir)) {
+  fs.mkdirSync(uploadsDir, { recursive: true });
+}
+
+const upload = multer({
+  storage: multer.diskStorage({
+    destination: uploadsDir,
+    filename: (req, file, callback) => {
+      const extension = path.extname(file.originalname).toLowerCase();
+      const uniqueName = `${Date.now()}-${Math.round(
+        Math.random() * 1e9
+      )}${extension}`;
+
+      callback(null, uniqueName);
+    },
+  }),
+  limits: {
+    fileSize: 2 * 1024 * 1024,
+  },
+  fileFilter: (req, file, callback) => {
+    const allowedTypes = ['image/jpeg', 'image/png', 'image/webp'];
+
+    if (!allowedTypes.includes(file.mimetype)) {
+      return callback(null, false);
+    }
+
+    callback(null, true);
+  },
+});
+
 const parseGradePeriod = (value?: string): GradePeriod => {
   if (value === 'TRIMESTER_2') return 'TRIMESTER_2';
   if (value === 'TRIMESTER_3') return 'TRIMESTER_3';
@@ -38,6 +73,7 @@ const parseGradePeriod = (value?: string): GradePeriod => {
 
 
 app.use(cors());
+app.use('/uploads', express.static(uploadsDir));
 app.use(express.json());
 
 const authenticateToken = (req: Request, res: Response, next: NextFunction): any => {
@@ -295,6 +331,7 @@ const publicUserSelect = {
   lastName: true,
   email: true,
   role: true,
+  profileImage: true,
 } as const;
 
 const messageUserSelect = publicUserSelect;
@@ -612,6 +649,7 @@ app.post('/api/login', async (req: Request, res: Response): Promise<any> => {
       role: user.role,
       firstName: user.firstName,
       lastName: user.lastName,
+      profileImage: user.profileImage,
     });
   } catch (error) {
     res.status(500).json({ error: "Login failed" });
@@ -783,9 +821,99 @@ app.post('/api/register', authenticateToken, requireAdmin, async (req: Request, 
   }
 });
 app.get('/api/users', authenticateToken, requireAdmin, async (req: Request, res: Response) => {
-  try { res.json(await prisma.user.findMany({ select: { id: true, firstName: true, lastName: true, email: true, role: true, createdAt: true }, orderBy: { createdAt: 'desc' } })); } 
-  catch (error) { res.status(500).json({ error: "Failed to fetch users" }); }
+  try {
+    res.json(
+      await prisma.user.findMany({
+        select: {
+          ...publicUserSelect,
+          createdAt: true,
+        },
+        orderBy: { createdAt: 'desc' },
+      })
+    );
+  } catch (error) {
+    res.status(500).json({ error: "Failed to fetch users" });
+  }
 });
+
+app.post(
+  '/api/users/:id/profile-image',
+  authenticateToken,
+  requireAdmin,
+  upload.single('profileImage'),
+  async (req: Request, res: Response): Promise<any> => {
+    try {
+      const userId = req.params.id as string;
+
+      if (!req.file) {
+        return res.status(400).json({
+          error: 'Please upload a valid image file: JPG, PNG or WEBP, max 2MB.',
+        });
+      }
+
+      const existingUser = await prisma.user.findUnique({
+        where: { id: userId },
+        select: {
+          id: true,
+          firstName: true,
+          lastName: true,
+          email: true,
+          profileImage: true,
+        },
+      });
+
+      if (!existingUser) {
+        fs.unlinkSync(req.file.path);
+        return res.status(404).json({ error: 'User not found!' });
+      }
+
+      const profileImage = `/uploads/${req.file.filename}`;
+
+      const updatedUser = await prisma.user.update({
+        where: { id: userId },
+        data: {
+          profileImage,
+        },
+        select: {
+          ...publicUserSelect,
+          createdAt: true,
+        },
+      });
+
+      if (existingUser.profileImage?.startsWith('/uploads/')) {
+        const previousFilePath = path.join(
+          uploadsDir,
+          path.basename(existingUser.profileImage)
+        );
+
+        if (fs.existsSync(previousFilePath)) {
+          fs.unlinkSync(previousFilePath);
+        }
+      }
+
+      await createAuditLog(req, {
+        action: 'UPDATE_USER_PROFILE_IMAGE',
+        entity: 'User',
+        entityId: updatedUser.id,
+        details: {
+          email: existingUser.email,
+          firstName: existingUser.firstName,
+          lastName: existingUser.lastName,
+          profileImage,
+        },
+      });
+
+      return res.json({
+        message: 'Profile image updated!',
+        user: updatedUser,
+      });
+    } catch (error) {
+      console.error('POST /api/users/:id/profile-image error:', error);
+      return res.status(500).json({ error: 'Failed to update profile image' });
+    }
+  }
+);
+
 app.put('/api/users/:id', authenticateToken, requireAdmin, async (req: Request, res: Response): Promise<any> => {
   try {
     const userId = req.params.id as string;
@@ -942,7 +1070,26 @@ app.post('/api/classes', authenticateToken, requireAdmin, async (req: Request, r
     res.status(500).json({ error: 'Failed' });
   }
 });
-app.get('/api/classes/:id', authenticateToken, requireAdmin, async (req: Request, res: Response): Promise<any> => { try { res.json(await prisma.class.findUnique({ where: { id: req.params.id as string }, include: { students: { include: { user: { select: { firstName: true, lastName: true, email: true } } } } } })); } catch (error) { res.status(500).json({ error: "Failed" }); } });
+app.get('/api/classes/:id', authenticateToken, requireAdmin, async (req: Request, res: Response): Promise<any> => {
+  try {
+    res.json(
+      await prisma.class.findUnique({
+        where: { id: req.params.id as string },
+        include: {
+          students: {
+            include: {
+              user: {
+                select: publicUserSelect,
+              },
+            },
+          },
+        },
+      })
+    );
+  } catch (error) {
+    res.status(500).json({ error: "Failed" });
+  }
+});
 app.delete('/api/classes/:id', authenticateToken, requireAdmin, async (req: Request, res: Response): Promise<any> => {
   try {
     const classId = req.params.id as string;
