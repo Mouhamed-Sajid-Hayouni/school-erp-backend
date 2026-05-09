@@ -914,6 +914,68 @@ app.post(
   }
 );
 
+app.put(
+  '/api/users/:id/password',
+  authenticateToken,
+  requireAdmin,
+  async (req: Request, res: Response): Promise<any> => {
+    try {
+      const userId = req.params.id as string;
+      const newPassword = String(req.body.password ?? '');
+
+      if (!newPassword) {
+        return res.status(400).json({ error: 'password is required!' });
+      }
+
+      if (newPassword.length < 10) {
+        return res.status(400).json({
+          error: 'Password must be at least 10 characters long!',
+        });
+      }
+
+      const existingUser = await prisma.user.findUnique({
+        where: { id: userId },
+        select: {
+          id: true,
+          email: true,
+          firstName: true,
+          lastName: true,
+          role: true,
+        },
+      });
+
+      if (!existingUser) {
+        return res.status(404).json({ error: 'User not found!' });
+      }
+
+      const salt = await bcrypt.genSalt(10);
+      const passwordHash = await bcrypt.hash(newPassword, salt);
+
+      await prisma.user.update({
+        where: { id: userId },
+        data: { passwordHash },
+      });
+
+      await createAuditLog(req, {
+        action: 'UPDATE_USER_PASSWORD',
+        entity: 'User',
+        entityId: existingUser.id,
+        details: {
+          email: existingUser.email,
+          firstName: existingUser.firstName,
+          lastName: existingUser.lastName,
+          role: existingUser.role,
+        },
+      });
+
+      return res.json({ message: 'Password updated!' });
+    } catch (error) {
+      console.error('PUT /api/users/:id/password error:', error);
+      return res.status(500).json({ error: 'Failed to update password' });
+    }
+  }
+);
+
 app.put('/api/users/:id', authenticateToken, requireAdmin, async (req: Request, res: Response): Promise<any> => {
   try {
     const userId = req.params.id as string;
