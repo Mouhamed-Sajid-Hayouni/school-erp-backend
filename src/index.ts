@@ -3,6 +3,7 @@ import cors from 'cors';
 import path from 'path';
 import fs from 'fs';
 import multer from 'multer';
+import { v2 as cloudinary, UploadApiResponse } from 'cloudinary';
 import { PrismaClient, Prisma, GradePeriod, AnnouncementAudience, Role } from '@prisma/client';
 import { Pool } from 'pg';
 import { PrismaPg } from '@prisma/adapter-pg';
@@ -13,6 +14,24 @@ import 'dotenv/config';
 const connectionString = process.env.DATABASE_URL;
 const JWT_SECRET = process.env.JWT_SECRET;
 const PORT = Number(process.env.PORT || 5000);
+
+const CLOUDINARY_CLOUD_NAME = process.env.CLOUDINARY_CLOUD_NAME;
+const CLOUDINARY_API_KEY = process.env.CLOUDINARY_API_KEY;
+const CLOUDINARY_API_SECRET = process.env.CLOUDINARY_API_SECRET;
+
+const isCloudinaryConfigured = Boolean(
+  CLOUDINARY_CLOUD_NAME &&
+    CLOUDINARY_API_KEY &&
+    CLOUDINARY_API_SECRET
+);
+
+if (isCloudinaryConfigured) {
+  cloudinary.config({
+    cloud_name: CLOUDINARY_CLOUD_NAME,
+    api_key: CLOUDINARY_API_KEY,
+    api_secret: CLOUDINARY_API_SECRET,
+  });
+}
 
 if (!connectionString) {
   throw new Error("DATABASE_URL is missing");
@@ -40,17 +59,7 @@ if (!fs.existsSync(uploadsDir)) {
 }
 
 const upload = multer({
-  storage: multer.diskStorage({
-    destination: uploadsDir,
-    filename: (req, file, callback) => {
-      const extension = path.extname(file.originalname).toLowerCase();
-      const uniqueName = `${Date.now()}-${Math.round(
-        Math.random() * 1e9
-      )}${extension}`;
-
-      callback(null, uniqueName);
-    },
-  }),
+  storage: multer.memoryStorage(),
   limits: {
     fileSize: 2 * 1024 * 1024,
   },
@@ -64,6 +73,44 @@ const upload = multer({
     callback(null, true);
   },
 });
+
+const uploadProfileImageToCloudinary = (
+  file: Express.Multer.File,
+  userId: string
+) => {
+  return new Promise<UploadApiResponse>((resolve, reject) => {
+    const stream = cloudinary.uploader.upload_stream(
+      {
+        folder: 'school-erp/profile-images',
+        public_id: `${userId}-${Date.now()}`,
+        resource_type: 'image',
+        overwrite: true,
+        transformation: [
+          {
+            width: 400,
+            height: 400,
+            crop: 'fill',
+            gravity: 'face',
+          },
+          {
+            quality: 'auto',
+            fetch_format: 'auto',
+          },
+        ],
+      },
+      (error, result) => {
+        if (error || !result) {
+          reject(error || new Error('Cloudinary upload failed'));
+          return;
+        }
+
+        resolve(result);
+      }
+    );
+
+    stream.end(file.buffer);
+  });
+};
 
 const parseGradePeriod = (value?: string): GradePeriod => {
   if (value === 'TRIMESTER_2') return 'TRIMESTER_2';
@@ -863,11 +910,17 @@ app.post(
       });
 
       if (!existingUser) {
-        fs.unlinkSync(req.file.path);
         return res.status(404).json({ error: 'User not found!' });
       }
 
-      const profileImage = `/uploads/${req.file.filename}`;
+      if (!isCloudinaryConfigured) {
+        return res.status(500).json({
+          error: 'Cloudinary is not configured on the server.',
+        });
+      }
+
+      const uploadedImage = await uploadProfileImageToCloudinary(req.file, userId);
+      const profileImage = uploadedImage.secure_url;
 
       const updatedUser = await prisma.user.update({
         where: { id: userId },
