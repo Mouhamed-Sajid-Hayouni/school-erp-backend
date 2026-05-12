@@ -9,6 +9,7 @@ import { Pool } from 'pg';
 import { PrismaPg } from '@prisma/adapter-pg';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
+import { randomBytes } from 'crypto';
 import 'dotenv/config';
 
 const connectionString = process.env.DATABASE_URL;
@@ -738,9 +739,17 @@ app.post('/api/register', authenticateToken, requireAdmin, async (req: Request, 
       Role.PARENT,
     ];
 
-    if (!normalizedEmail || !normalizedPassword || !normalizedFirstName || !normalizedLastName) {
+    if (
+      !normalizedEmail ||
+      !normalizedFirstName ||
+      !normalizedLastName ||
+      (normalizedRole !== Role.STUDENT && !normalizedPassword)
+    ) {
       return res.status(400).json({
-        error: 'email, password, firstName and lastName are required!',
+        error:
+          normalizedRole === Role.STUDENT
+            ? 'email, firstName and lastName are required!'
+            : 'email, password, firstName and lastName are required!',
       });
     }
 
@@ -808,8 +817,13 @@ app.post('/api/register', authenticateToken, requireAdmin, async (req: Request, 
       }
     }
 
+    const passwordToHash =
+      normalizedRole === Role.STUDENT && !normalizedPassword
+        ? randomBytes(32).toString('hex')
+        : normalizedPassword;
+
     const salt = await bcrypt.genSalt(10);
-    const hashedPassword = await bcrypt.hash(normalizedPassword, salt);
+    const hashedPassword = await bcrypt.hash(passwordToHash, salt);
 
     const createdUser = await prisma.$transaction(async (tx) => {
       const newUser = await tx.user.create({
