@@ -675,6 +675,13 @@ app.post('/api/login', async (req: Request, res: Response): Promise<any> => {
       return res.status(403).json({ error: 'This account is inactive.' });
     }
 
+    if (user.role === Role.STUDENT) {
+      return res.status(403).json({
+        error:
+          'Student accounts cannot access the system directly. Please use a parent account.',
+      });
+    }
+
     const isPasswordValid = await bcrypt.compare(
       normalizedPassword,
       user.passwordHash
