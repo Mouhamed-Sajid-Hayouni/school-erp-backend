@@ -4056,7 +4056,7 @@ app.put('/api/messages/conversations/:id/read', authenticateToken, async (req: R
   }
 });
 
-// --- NEW MAGIC: THE STUDENT/PARENT PORTAL ---
+// --- PARENT PORTAL ---
 app.get('/api/my-portal', authenticateToken, async (req: Request, res: Response): Promise<any> => {
   try {
     const userId = (req as any).user.userId;
