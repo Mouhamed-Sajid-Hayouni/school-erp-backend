@@ -4108,7 +4108,7 @@ app.get('/api/my-portal', authenticateToken, async (req: Request, res: Response)
     }
     
     res.status(403).json({
-      error: 'Only parents can view the student portal.',
+      error: 'Only parents can access the parent portal.',
     });
   } catch (error) {
     res.status(500).json({ error: "Failed to fetch portal data" });
