@@ -131,7 +131,15 @@ const authenticateToken = (req: Request, res: Response, next: NextFunction): any
 
   jwt.verify(token, JWT_SECRET, (err: any, user: any) => {
     if (err) return res.status(403).json({ error: "Invalid token!" });
-    (req as any).user = user; next(); 
+
+    if (user?.role === Role.STUDENT) {
+      return res.status(403).json({
+        error: 'Student accounts cannot access the system directly. Please use a parent account.',
+      });
+    }
+
+    (req as any).user = user;
+    next();
   });
 };
 
@@ -263,8 +271,12 @@ const isValidTimeValue = (value: unknown) => {
 };
 
 const parseAssignmentStatus = (value?: string) => {
-  const normalized = (value || 'PENDING').toUpperCase();
-  return normalized === 'DONE' ? 'DONE' : 'PENDING';
+  const normalized = String(value ?? '').trim().toUpperCase();
+
+  if (normalized === 'DONE') return 'DONE';
+  if (normalized === 'PENDING') return 'PENDING';
+
+  return null;
 };
 
 const parseAttendanceStatus = (value?: string) => {
@@ -430,15 +442,6 @@ const getAllowedMessageRecipients = async (userId: string, role: string) => {
           ...(classIds.length > 0
             ? [
                 {
-                  studentProfile: {
-                    is: {
-                      classId: {
-                        in: classIds,
-                      },
-                    },
-                  },
-                },
-                {
                   parentProfile: {
                     is: {
                       children: {
@@ -464,45 +467,6 @@ const getAllowedMessageRecipients = async (userId: string, role: string) => {
     });
   }
 
-  if (role === Role.STUDENT) {
-    const student = await prisma.student.findUnique({
-      where: { userId },
-      select: {
-        classId: true,
-      },
-    });
-
-    return prisma.user.findMany({
-      where: {
-        isActive: true,
-        id: { not: userId },
-        OR: [
-          { role: Role.ADMIN },
-          ...(student?.classId
-            ? [
-                {
-                  teacherProfile: {
-                    is: {
-                      schedules: {
-                        some: {
-                          classId: student.classId,
-                        },
-                      },
-                    },
-                  },
-                },
-              ]
-            : []),
-        ],
-      },
-      select: messageUserSelect,
-      orderBy: [
-        { role: 'asc' },
-        { firstName: 'asc' },
-        { lastName: 'asc' },
-      ],
-    });
-  }
 
   if (role === Role.PARENT) {
     const parent = await prisma.parent.findUnique({
@@ -1022,6 +986,12 @@ app.put(
         return res.status(404).json({ error: 'User not found!' });
       }
 
+      if (existingUser.role === Role.STUDENT) {
+        return res.status(400).json({
+          error: 'Student accounts do not use direct login. Please use the parent account.',
+        });
+      }
+
       const salt = await bcrypt.genSalt(10);
       const passwordHash = await bcrypt.hash(newPassword, salt);
 
@@ -1131,6 +1101,26 @@ app.delete('/api/users/:id', authenticateToken, requireAdmin, async (req: Reques
 
 if (!userToDelete) {
   return res.status(404).json({ error: 'User not found!' });
+}
+
+const currentUserId = (req as any).user.userId;
+
+if (userId === currentUserId) {
+  return res.status(400).json({
+    error: 'You cannot delete your own account.',
+  });
+}
+
+if (userToDelete.role === Role.ADMIN) {
+  const adminCount = await prisma.user.count({
+    where: { role: Role.ADMIN },
+  });
+
+  if (adminCount <= 1) {
+    return res.status(400).json({
+      error: 'You cannot delete the last admin account.',
+    });
+  }
 }
     await prisma.student.deleteMany({ where: { userId } });
     await prisma.teacher.deleteMany({ where: { userId } }); 
@@ -1999,7 +1989,6 @@ app.post('/api/grades', authenticateToken, async (req: Request, res: Response): 
     });
 
     const notificationUserIds = [
-      studentProfile.userId,
       studentProfile.parent?.userId,
     ].filter(Boolean) as string[];
 
@@ -2638,7 +2627,28 @@ app.post('/api/assignments', authenticateToken, async (req: Request, res: Respon
       return res.status(400).json({ error: 'dueDate must be a valid date!' });
     }
 
-    let resolvedTeacherId: string | null = teacherId || null;
+    const selectedClass = await prisma.class.findUnique({
+      where: { id: classId },
+      select: { id: true },
+    });
+
+    if (!selectedClass) {
+      return res.status(400).json({ error: 'Selected class does not exist!' });
+    }
+
+    const selectedSubject = await prisma.subject.findUnique({
+      where: { id: subjectId },
+      select: { id: true },
+    });
+
+    if (!selectedSubject) {
+      return res.status(400).json({ error: 'Selected subject does not exist!' });
+    }
+
+    let resolvedTeacherId: string | null =
+      teacherId === undefined || teacherId === null || String(teacherId).trim() === ''
+        ? null
+        : String(teacherId).trim();
 
     if (role === 'TEACHER') {
       const teacherIdFromToken = await getTeacherProfileId(userId);
@@ -2664,6 +2674,29 @@ app.post('/api/assignments', authenticateToken, async (req: Request, res: Respon
 
       resolvedTeacherId = teacherIdFromToken;
     }
+
+    if (role === 'ADMIN') {
+  if (!resolvedTeacherId) {
+    return res.status(400).json({
+      error: 'teacherId is required when an admin creates an assignment.',
+    });
+  }
+
+  const teacherScope = await prisma.schedule.findFirst({
+    where: {
+      teacherId: resolvedTeacherId,
+      classId,
+      subjectId,
+    },
+    select: { id: true },
+  });
+
+  if (!teacherScope) {
+    return res.status(400).json({
+      error: 'Selected teacher is not scheduled for this class and subject.',
+    });
+  }
+}
 
     const created = await prisma.assignment.create({
       data: {
@@ -2901,34 +2934,6 @@ app.get('/api/my-assignments', authenticateToken, async (req: Request, res: Resp
     const userId = (req as any).user.userId;
     const role = (req as any).user.role;
 
-    if (role === 'STUDENT') {
-      const student = await prisma.student.findUnique({
-        where: { userId },
-        include: {
-          submissions: {
-            include: {
-              assignment: {
-                include: {
-                  class: true,
-                  subject: true,
-                  teacher: { include: { user: {
-  select: publicUserSelect,
-} } },
-                },
-              },
-            },
-          },
-        },
-      });
-
-      const submissions = (student?.submissions ?? []).sort(
-        (a, b) =>
-          new Date(a.assignment.dueDate).getTime() -
-          new Date(b.assignment.dueDate).getTime()
-      );
-
-      return res.json(submissions);
-    }
 
     if (role === 'PARENT') {
       const parent = await prisma.parent.findUnique({
@@ -2969,7 +2974,9 @@ app.get('/api/my-assignments', authenticateToken, async (req: Request, res: Resp
       return res.json(children);
     }
 
-    return res.status(403).json({ error: 'Only students and parents can view assignments.' });
+    return res.status(403).json({
+      error: 'Only parents can view student assignments.',
+    });
   } catch (error) {
     console.error('GET /api/my-assignments error:', error);
     res.status(500).json({ error: 'Failed to fetch assignments' });
@@ -3000,27 +3007,29 @@ app.put('/api/assignment-submissions/:id', authenticateToken, async (req: Reques
       return res.status(404).json({ error: 'Assignment submission not found!' });
     }
 
-    if (role === 'STUDENT') {
-      const student = await prisma.student.findUnique({
-        where: { userId },
+    if (role !== 'PARENT') {
+      return res.status(403).json({
+        error: 'Only parents can update assignment submissions for their children.',
       });
+    }
 
-      if (!student || student.id !== submission.studentId) {
-        return res.status(403).json({ error: 'You can only update your own assignments.' });
-      }
-    } else if (role === 'PARENT') {
-      const parent = await prisma.parent.findUnique({
-        where: { userId },
+    const parent = await prisma.parent.findUnique({
+      where: { userId },
+    });
+
+    if (!parent || submission.student.parentId !== parent.id) {
+      return res.status(403).json({
+        error: 'You can only update your child assignments.',
       });
-
-      if (!parent || submission.student.parentId !== parent.id) {
-        return res.status(403).json({ error: 'You can only update your child assignments.' });
-      }
-    } else {
-      return res.status(403).json({ error: 'Only students and parents can update assignment submissions.' });
     }
 
     const normalizedStatus = parseAssignmentStatus(status);
+
+    if (!normalizedStatus) {
+      return res.status(400).json({
+        error: 'status must be PENDING or DONE!',
+      });
+    }
     const normalizedNotes =
       notes === undefined || notes === null ? null : String(notes).trim();
 
@@ -3186,26 +3195,34 @@ app.post('/api/announcements', authenticateToken, async (req: Request, res: Resp
 
     if (parsedAudience === AnnouncementAudience.ALL) {
       const users = await prisma.user.findMany({
+        where: {
+          role: {
+            not: Role.STUDENT,
+          },
+        },
         select: { id: true },
       });
+
       notificationUserIds = users.map((user) => user.id);
     } else if (parsedAudience === AnnouncementAudience.STUDENTS) {
-      const users = await prisma.user.findMany({
-        where: { role: 'STUDENT' },
-        select: { id: true },
+      const parents = await prisma.parent.findMany({
+        select: { userId: true },
       });
-      notificationUserIds = users.map((user) => user.id);
+
+      notificationUserIds = parents.map((parent) => parent.userId);
     } else if (parsedAudience === AnnouncementAudience.PARENTS) {
       const users = await prisma.user.findMany({
-        where: { role: 'PARENT' },
+        where: { role: Role.PARENT },
         select: { id: true },
       });
+
       notificationUserIds = users.map((user) => user.id);
     } else if (parsedAudience === AnnouncementAudience.TEACHERS) {
       const users = await prisma.user.findMany({
-        where: { role: 'TEACHER' },
+        where: { role: Role.TEACHER },
         select: { id: true },
       });
+
       notificationUserIds = users.map((user) => user.id);
     } else if (parsedAudience === AnnouncementAudience.CLASS && normalizedClassId) {
       const students = await prisma.student.findMany({
@@ -3215,12 +3232,9 @@ app.post('/api/announcements', authenticateToken, async (req: Request, res: Resp
         },
       });
 
-      notificationUserIds = [
-        ...students.map((student) => student.userId),
-        ...students
-          .map((student) => student.parent?.userId)
-          .filter(Boolean) as string[],
-      ];
+      notificationUserIds = students
+        .map((student) => student.parent?.userId)
+        .filter(Boolean) as string[];
     }
 
     await createNotificationsForUserIds(
@@ -3376,36 +3390,6 @@ app.get('/api/my-announcements', authenticateToken, async (req: Request, res: Re
     const userId = (req as any).user.userId;
     const role = (req as any).user.role;
 
-    if (role === 'STUDENT') {
-      const student = await prisma.student.findUnique({
-        where: { userId },
-      });
-
-      const announcements = await prisma.announcement.findMany({
-  where: {
-    OR: [
-      { audience: AnnouncementAudience.ALL },
-      { audience: AnnouncementAudience.STUDENTS },
-      ...(student?.classId
-        ? [{ audience: AnnouncementAudience.CLASS, classId: student.classId }]
-        : []),
-    ],
-  },
-  include: {
-    class: true,
-    createdBy: {
-      select: {
-        firstName: true,
-        lastName: true,
-        role: true,
-      },
-    },
-  },
-  orderBy: { createdAt: 'desc' },
-});
-
-      return res.json(announcements);
-    }
 
     if (role === 'PARENT') {
       const parent = await prisma.parent.findUnique({
@@ -3422,6 +3406,7 @@ app.get('/api/my-announcements', authenticateToken, async (req: Request, res: Re
     OR: [
       { audience: AnnouncementAudience.ALL },
       { audience: AnnouncementAudience.PARENTS },
+      { audience: AnnouncementAudience.STUDENTS },
       ...(classIds.length > 0
         ? [{ audience: AnnouncementAudience.CLASS, classId: { in: classIds } }]
         : []),
@@ -3573,7 +3558,6 @@ app.post('/api/notify-bulletin/:studentId', authenticateToken, async (req: Reque
     }
 
     const notificationUserIds = [
-      student.userId,
       student.parent?.userId,
     ].filter(Boolean) as string[];
 
@@ -4077,48 +4061,8 @@ app.get('/api/my-portal', authenticateToken, async (req: Request, res: Response)
   try {
     const userId = (req as any).user.userId;
     const role = (req as any).user.role;
-
-    if (role === 'STUDENT') {
-      // Find the student and ALL their grades, attendance, and class schedules!
-      const studentInfo = await prisma.student.findUnique({
-  where: { userId: userId },
-  include: {
-    user: {
-      select: publicUserSelect,
-    },
-    class: {
-      include: {
-        schedules: {
-          include: {
-            subject: true,
-            teacher: {
-              include: {
-                user: {
-                  select: publicUserSelect,
-                },
-              },
-            },
-          },
-        },
-      },
-    },
-    grades: {
-      include: { subject: true },
-      orderBy: { createdAt: 'desc' },
-    },
-    attendances: {
-      include: {
-        schedule: {
-          include: { subject: true },
-        },
-      },
-      orderBy: { date: 'desc' },
-    },
-  },
-});
-      return res.json(studentInfo);
-    } 
-    else if (role === 'PARENT') {
+ 
+    if (role === 'PARENT') {
       // Find the parent and grab THEIR CHILD's info!
       const parentInfo = await prisma.parent.findUnique({
   where: { userId: userId },
@@ -4163,7 +4107,9 @@ app.get('/api/my-portal', authenticateToken, async (req: Request, res: Response)
       return res.json(parentInfo);
     }
     
-    res.status(403).json({ error: "Only Students and Parents can view this." });
+    res.status(403).json({
+      error: 'Only parents can view the student portal.',
+    });
   } catch (error) {
     res.status(500).json({ error: "Failed to fetch portal data" });
   }
