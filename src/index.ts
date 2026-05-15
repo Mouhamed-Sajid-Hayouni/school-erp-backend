@@ -521,7 +521,7 @@ const getAllowedMessageRecipients = async (userId: string, role: string) => {
   return [];
 };
 
-app.get('/', (req: Request, res: Response) => res.send('🎉 API is running!'));
+app.get('/', (req: Request, res: Response) => res.send('ðŸŽ‰ API is running!'));
 
 app.get('/api/health', async (req: Request, res: Response): Promise<any> => {
   try {
@@ -619,7 +619,6 @@ app.post('/api/login', async (req: Request, res: Response): Promise<any> => {
         error: 'email and password are required!',
       });
     }
-
     const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
     if (!emailPattern.test(normalizedEmail)) {
@@ -680,11 +679,12 @@ app.post('/api/register', authenticateToken, requireAdmin, async (req: Request, 
   try {
     const { email, password, firstName, lastName, role, classId, studentUserId } = req.body;
 
-    const normalizedEmail = String(email ?? '').trim().toLowerCase();
+    const normalizedRole = String(role ?? Role.PARENT).trim().toUpperCase() as Role;
+    const isStudentRole = normalizedRole === Role.STUDENT;
+    const normalizedEmail = isStudentRole ? '' : String(email ?? '').trim().toLowerCase();
     const normalizedFirstName = String(firstName ?? '').trim();
     const normalizedLastName = String(lastName ?? '').trim();
-    const normalizedPassword = String(password ?? '');
-    const normalizedRole = String(role ?? Role.STUDENT).trim().toUpperCase() as Role;
+    const normalizedPassword = isStudentRole ? randomBytes(32).toString('hex') : String(password ?? '');
 
     const normalizedClassId =
       classId === undefined || classId === null || String(classId).trim() === ''
@@ -702,24 +702,21 @@ app.post('/api/register', authenticateToken, requireAdmin, async (req: Request, 
       Role.STUDENT,
       Role.PARENT,
     ];
-
     if (
-      !normalizedEmail ||
       !normalizedFirstName ||
       !normalizedLastName ||
-      (normalizedRole !== Role.STUDENT && !normalizedPassword)
+      (!isStudentRole && (!normalizedEmail || !normalizedPassword))
     ) {
       return res.status(400).json({
-        error:
-          normalizedRole === Role.STUDENT
-            ? 'email, firstName and lastName are required!'
-            : 'email, password, firstName and lastName are required!',
+        error: isStudentRole
+          ? 'firstName and lastName are required for student records!'
+          : 'email, password, firstName and lastName are required!',
       });
     }
 
     const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
-    if (!emailPattern.test(normalizedEmail)) {
+    if (!isStudentRole && !emailPattern.test(normalizedEmail)) {
       return res.status(400).json({
         error: 'Email must be valid!',
       });
@@ -730,19 +727,20 @@ app.post('/api/register', authenticateToken, requireAdmin, async (req: Request, 
         error: 'Role is invalid!',
       });
     }
+    if (!isStudentRole) {
+      const existingUser = await prisma.user.findUnique({
+        where: { email: normalizedEmail },
+        select: { id: true },
+      });
 
-    const existingUser = await prisma.user.findUnique({
-      where: { email: normalizedEmail },
-      select: { id: true },
-    });
-
-    if (existingUser) {
-      return res.status(400).json({ error: 'Email already in use!' });
+      if (existingUser) {
+        return res.status(400).json({ error: 'Email already in use!' });
+      }
     }
 
     let validatedClassId: string | null = null;
 
-    if (normalizedRole === Role.STUDENT && normalizedClassId) {
+    if (isStudentRole && normalizedClassId) {
       const existingClass = await prisma.class.findUnique({
         where: { id: normalizedClassId },
         select: { id: true },
@@ -780,11 +778,13 @@ app.post('/api/register', authenticateToken, requireAdmin, async (req: Request, 
         });
       }
     }
+    const passwordToHash = isStudentRole
+      ? randomBytes(32).toString('hex')
+      : normalizedPassword;
 
-    const passwordToHash =
-      normalizedRole === Role.STUDENT && !normalizedPassword
-        ? randomBytes(32).toString('hex')
-        : normalizedPassword;
+    const loginEmail = isStudentRole
+      ? `student-${randomBytes(16).toString('hex')}@internal.school.local`
+      : normalizedEmail;
 
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(passwordToHash, salt);
@@ -792,7 +792,7 @@ app.post('/api/register', authenticateToken, requireAdmin, async (req: Request, 
     const createdUser = await prisma.$transaction(async (tx) => {
       const newUser = await tx.user.create({
         data: {
-          email: normalizedEmail,
+          email: loginEmail,
           passwordHash: hashedPassword,
           firstName: normalizedFirstName,
           lastName: normalizedLastName,
@@ -800,7 +800,7 @@ app.post('/api/register', authenticateToken, requireAdmin, async (req: Request, 
         },
       });
 
-      if (normalizedRole === Role.STUDENT) {
+      if (isStudentRole) {
         await tx.student.create({
           data: {
             userId: newUser.id,
@@ -839,7 +839,7 @@ app.post('/api/register', authenticateToken, requireAdmin, async (req: Request, 
       entity: 'User',
       entityId: createdUser.id,
       details: {
-        email: createdUser.email,
+        email: isStudentRole ? null : createdUser.email,
         firstName: createdUser.firstName,
         lastName: createdUser.lastName,
         role: createdUser.role,
@@ -4279,4 +4279,4 @@ app.put(
   }
 );
 
-app.listen(PORT, () => console.log(`🚀 Server is running on http://localhost:${PORT}`));
+app.listen(PORT, () => console.log(`ðŸš€ Server is running on http://localhost:${PORT}`));
