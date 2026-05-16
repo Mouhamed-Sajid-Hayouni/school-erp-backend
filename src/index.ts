@@ -1027,45 +1027,68 @@ app.put('/api/users/:id', authenticateToken, requireAdmin, async (req: Request, 
     const normalizedLastName = String(req.body.lastName ?? '').trim();
     const normalizedEmail = String(req.body.email ?? '').trim().toLowerCase();
 
-    if (!normalizedFirstName || !normalizedLastName || !normalizedEmail) {
-      return res.status(400).json({
-        error: 'firstName, lastName and email are required!',
-      });
-    }
-
-    const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-
-    if (!emailPattern.test(normalizedEmail)) {
-      return res.status(400).json({
-        error: 'Email must be valid!',
-      });
-    }
-
     const existingUser = await prisma.user.findUnique({
       where: { id: userId },
-      select: { id: true },
+      select: {
+        id: true,
+        email: true,
+        role: true,
+      },
     });
 
     if (!existingUser) {
       return res.status(404).json({ error: 'User not found!' });
     }
 
-    const emailOwner = await prisma.user.findUnique({
-      where: { email: normalizedEmail },
-      select: { id: true },
-    });
+    const isStudentRole = existingUser.role === Role.STUDENT;
 
-    if (emailOwner && emailOwner.id !== userId) {
-      return res.status(400).json({ error: 'Email already in use!' });
+    if (
+      !normalizedFirstName ||
+      !normalizedLastName ||
+      (!isStudentRole && !normalizedEmail)
+    ) {
+      return res.status(400).json({
+        error: isStudentRole
+          ? 'firstName and lastName are required for student records!'
+          : 'firstName, lastName and email are required!',
+      });
+    }
+
+    const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+    if (!isStudentRole && !emailPattern.test(normalizedEmail)) {
+      return res.status(400).json({
+        error: 'Email must be valid!',
+      });
+    }
+
+    if (!isStudentRole) {
+      const emailOwner = await prisma.user.findUnique({
+        where: { email: normalizedEmail },
+        select: { id: true },
+      });
+
+      if (emailOwner && emailOwner.id !== userId) {
+        return res.status(400).json({ error: 'Email already in use!' });
+      }
+    }
+
+    const updateData: {
+      firstName: string;
+      lastName: string;
+      email?: string;
+    } = {
+      firstName: normalizedFirstName,
+      lastName: normalizedLastName,
+    };
+
+    if (!isStudentRole) {
+      updateData.email = normalizedEmail;
     }
 
     const updatedUser = await prisma.user.update({
       where: { id: userId },
-      data: {
-        firstName: normalizedFirstName,
-        lastName: normalizedLastName,
-        email: normalizedEmail,
-      },
+      data: updateData,
     });
 
     await createAuditLog(req, {
@@ -1073,17 +1096,20 @@ app.put('/api/users/:id', authenticateToken, requireAdmin, async (req: Request, 
       entity: 'User',
       entityId: updatedUser.id,
       details: {
-        email: updatedUser.email,
+        email: isStudentRole ? null : updatedUser.email,
         firstName: updatedUser.firstName,
         lastName: updatedUser.lastName,
+        role: updatedUser.role,
       },
     });
 
-    res.json({ message: 'Updated!' });
+    return res.json(updatedUser);
   } catch (error) {
+    console.error('PUT /api/users/:id error:', error);
     res.status(500).json({ error: 'Failed to update user' });
   }
 });
+
 app.delete('/api/users/:id', authenticateToken, requireAdmin, async (req: Request, res: Response): Promise<any> => {
   try {
     const userId = req.params.id as string;
