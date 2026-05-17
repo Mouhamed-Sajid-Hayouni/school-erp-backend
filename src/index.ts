@@ -961,16 +961,6 @@ app.put(
       const userId = req.params.id as string;
       const newPassword = String(req.body.password ?? '');
 
-      if (!newPassword) {
-        return res.status(400).json({ error: 'password is required!' });
-      }
-
-      if (newPassword.length < 10) {
-        return res.status(400).json({
-          error: 'Password must be at least 10 characters long!',
-        });
-      }
-
       const existingUser = await prisma.user.findUnique({
         where: { id: userId },
         select: {
@@ -983,12 +973,24 @@ app.put(
       });
 
       if (!existingUser) {
-        return res.status(404).json({ error: 'User not found!' });
+        return res.status(404).json({
+          error: 'User not found!',
+        });
       }
 
       if (existingUser.role === Role.STUDENT) {
         return res.status(400).json({
-          error: 'Student accounts do not use direct login. Please use the parent account.',
+          error: 'Student records do not have direct login credentials!',
+        });
+      }
+
+      if (!newPassword) {
+        return res.status(400).json({ error: 'password is required!' });
+      }
+
+      if (newPassword.length < 10) {
+        return res.status(400).json({
+          error: 'Password must be at least 10 characters long!',
         });
       }
 
