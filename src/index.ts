@@ -873,82 +873,10 @@ app.post(
   authenticateToken,
   requireAdmin,
   upload.single('profileImage'),
-  async (req: Request, res: Response): Promise<any> => {
-    try {
-      const userId = req.params.id as string;
-
-      if (!req.file) {
-        return res.status(400).json({
-          error: 'Please upload a valid image file: JPG, PNG or WEBP, max 2MB.',
-        });
-      }
-
-      const existingUser = await prisma.user.findUnique({
-        where: { id: userId },
-        select: {
-          id: true,
-          firstName: true,
-          lastName: true,
-          email: true,
-          profileImage: true,
-        },
-      });
-
-      if (!existingUser) {
-        return res.status(404).json({ error: 'User not found!' });
-      }
-
-      if (!isCloudinaryConfigured) {
-        return res.status(500).json({
-          error: 'Cloudinary is not configured on the server.',
-        });
-      }
-
-      const uploadedImage = await uploadProfileImageToCloudinary(req.file, userId);
-      const profileImage = uploadedImage.secure_url;
-
-      const updatedUser = await prisma.user.update({
-        where: { id: userId },
-        data: {
-          profileImage,
-        },
-        select: {
-          ...publicUserSelect,
-          createdAt: true,
-        },
-      });
-
-      if (existingUser.profileImage?.startsWith('/uploads/')) {
-        const previousFilePath = path.join(
-          uploadsDir,
-          path.basename(existingUser.profileImage)
-        );
-
-        if (fs.existsSync(previousFilePath)) {
-          fs.unlinkSync(previousFilePath);
-        }
-      }
-
-      await createAuditLog(req, {
-        action: 'UPDATE_USER_PROFILE_IMAGE',
-        entity: 'User',
-        entityId: updatedUser.id,
-        details: {
-          email: existingUser.email,
-          firstName: existingUser.firstName,
-          lastName: existingUser.lastName,
-          profileImage,
-        },
-      });
-
-      return res.json({
-        message: 'Profile image updated!',
-        user: updatedUser,
-      });
-    } catch (error) {
-      console.error('POST /api/users/:id/profile-image error:', error);
-      return res.status(500).json({ error: 'Failed to update profile image' });
-    }
+  async (_req: Request, res: Response): Promise<any> => {
+    return res.status(403).json({
+      error: 'Users must update their own account information.',
+    });
   }
 );
 
@@ -956,225 +884,25 @@ app.put(
   '/api/users/:id/password',
   authenticateToken,
   requireAdmin,
-  async (req: Request, res: Response): Promise<any> => {
-    try {
-      const userId = req.params.id as string;
-      const newPassword = String(req.body.password ?? '');
-
-      const existingUser = await prisma.user.findUnique({
-        where: { id: userId },
-        select: {
-          id: true,
-          email: true,
-          firstName: true,
-          lastName: true,
-          role: true,
-        },
-      });
-
-      if (!existingUser) {
-        return res.status(404).json({
-          error: 'User not found!',
-        });
-      }
-
-      if (existingUser.role === Role.STUDENT) {
-        return res.status(400).json({
-          error: 'Student records do not have direct login credentials!',
-        });
-      }
-
-      if (!newPassword) {
-        return res.status(400).json({ error: 'password is required!' });
-      }
-
-      if (newPassword.length < 10) {
-        return res.status(400).json({
-          error: 'Password must be at least 10 characters long!',
-        });
-      }
-
-      const salt = await bcrypt.genSalt(10);
-      const passwordHash = await bcrypt.hash(newPassword, salt);
-
-      await prisma.user.update({
-        where: { id: userId },
-        data: { passwordHash },
-      });
-
-      await createAuditLog(req, {
-        action: 'UPDATE_USER_PASSWORD',
-        entity: 'User',
-        entityId: existingUser.id,
-        details: {
-          email: existingUser.email,
-          firstName: existingUser.firstName,
-          lastName: existingUser.lastName,
-          role: existingUser.role,
-        },
-      });
-
-      return res.json({ message: 'Password updated!' });
-    } catch (error) {
-      console.error('PUT /api/users/:id/password error:', error);
-      return res.status(500).json({ error: 'Failed to update password' });
-    }
+  async (_req: Request, res: Response): Promise<any> => {
+    return res.status(403).json({
+      error: 'Users must update their own account information.',
+    });
   }
 );
 
-app.put('/api/users/:id', authenticateToken, requireAdmin, async (req: Request, res: Response): Promise<any> => {
-  try {
-    const userId = req.params.id as string;
-    const normalizedFirstName = String(req.body.firstName ?? '').trim();
-    const normalizedLastName = String(req.body.lastName ?? '').trim();
-    const normalizedEmail = String(req.body.email ?? '').trim().toLowerCase();
-
-    const existingUser = await prisma.user.findUnique({
-      where: { id: userId },
-      select: {
-        id: true,
-        email: true,
-        role: true,
-      },
-    });
-
-    if (!existingUser) {
-      return res.status(404).json({ error: 'User not found!' });
-    }
-
-    const isStudentRole = existingUser.role === Role.STUDENT;
-
-    if (
-      !normalizedFirstName ||
-      !normalizedLastName ||
-      (!isStudentRole && !normalizedEmail)
-    ) {
-      return res.status(400).json({
-        error: isStudentRole
-          ? 'firstName and lastName are required for student records!'
-          : 'firstName, lastName and email are required!',
-      });
-    }
-
-    const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-
-    if (!isStudentRole && !emailPattern.test(normalizedEmail)) {
-      return res.status(400).json({
-        error: 'Email must be valid!',
-      });
-    }
-
-    if (!isStudentRole) {
-      const emailOwner = await prisma.user.findUnique({
-        where: { email: normalizedEmail },
-        select: { id: true },
-      });
-
-      if (emailOwner && emailOwner.id !== userId) {
-        return res.status(400).json({ error: 'Email already in use!' });
-      }
-    }
-
-    const updateData: {
-      firstName: string;
-      lastName: string;
-      email?: string;
-    } = {
-      firstName: normalizedFirstName,
-      lastName: normalizedLastName,
-    };
-
-    if (!isStudentRole) {
-      updateData.email = normalizedEmail;
-    }
-
-    const updatedUser = await prisma.user.update({
-      where: { id: userId },
-      data: updateData,
-    });
-
-    await createAuditLog(req, {
-      action: 'UPDATE_USER',
-      entity: 'User',
-      entityId: updatedUser.id,
-      details: {
-        email: isStudentRole ? null : updatedUser.email,
-        firstName: updatedUser.firstName,
-        lastName: updatedUser.lastName,
-        role: updatedUser.role,
-      },
-    });
-
-    return res.json(updatedUser);
-  } catch (error) {
-    console.error('PUT /api/users/:id error:', error);
-    res.status(500).json({ error: 'Failed to update user' });
-  }
-});
-
-app.delete('/api/users/:id', authenticateToken, requireAdmin, async (req: Request, res: Response): Promise<any> => {
-  try {
-    const userId = req.params.id as string;
-
-    const userToDelete = await prisma.user.findUnique({
-  where: { id: userId },
-  select: {
-    id: true,
-    email: true,
-    firstName: true,
-    lastName: true,
-    role: true,
-  },
-});
-
-if (!userToDelete) {
-  return res.status(404).json({ error: 'User not found!' });
-}
-
-const currentUserId = (req as any).user.userId;
-
-if (userId === currentUserId) {
-  return res.status(400).json({
-    error: 'You cannot delete your own account.',
+app.put('/api/users/:id', authenticateToken, requireAdmin, async (_req: Request, res: Response): Promise<any> => {
+  return res.status(403).json({
+    error: 'Users must update their own account information.',
   });
-}
+});
 
-if (userToDelete.role === Role.ADMIN) {
-  const adminCount = await prisma.user.count({
-    where: { role: Role.ADMIN },
+app.delete('/api/users/:id', authenticateToken, requireAdmin, async (_req: Request, res: Response): Promise<any> => {
+  return res.status(403).json({
+    error: 'Users must update their own account information.',
   });
-
-  if (adminCount <= 1) {
-    return res.status(400).json({
-      error: 'You cannot delete the last admin account.',
-    });
-  }
-}
-    await prisma.student.deleteMany({ where: { userId } });
-    await prisma.teacher.deleteMany({ where: { userId } }); 
-    const parentProfile = await prisma.parent.findUnique({ where: { userId } });
-    if (parentProfile) {
-      await prisma.student.updateMany({ where: { parentId: parentProfile.id }, data: { parentId: null } });
-      await prisma.parent.delete({ where: { id: parentProfile.id } });
-    }
-    await prisma.user.delete({ where: { id: userId } });
-
-    await createAuditLog(req, {
-  action: 'DELETE_USER',
-  entity: 'User',
-  entityId: userToDelete.id,
-  details: {
-    email: userToDelete.email,
-    firstName: userToDelete.firstName,
-    lastName: userToDelete.lastName,
-    role: userToDelete.role,
-  },
-});
-    res.json({ message: "User deleted!" });
-  } catch (error) { res.status(500).json({ error: "Failed to delete user" }); }
 });
 
-// STATS, CLASSES, SUBJECTS, TEACHERS, SCHEDULES, ATTENDANCE, GRADES (Unchanged)
 app.get('/api/stats', authenticateToken, requireAdmin, async (req: Request, res: Response) => { try { res.json({ totalUsers: await prisma.user.count(), totalTeachers: await prisma.user.count({ where: { role: 'TEACHER' } }), totalStudents: await prisma.user.count({ where: { role: 'STUDENT' } }), totalAdmins: await prisma.user.count({ where: { role: 'ADMIN' } }) }); } catch (error) { res.status(500).json({ error: "Failed" }); } });
 app.get('/api/classes', authenticateToken, requireAdmin, async (req: Request, res: Response) => { try { res.json(await prisma.class.findMany({ include: { _count: { select: { students: true } } }, orderBy: { name: 'asc' } })); } catch (error) { res.status(500).json({ error: "Failed" }); } });
 app.post('/api/classes', authenticateToken, requireAdmin, async (req: Request, res: Response): Promise<any> => {
