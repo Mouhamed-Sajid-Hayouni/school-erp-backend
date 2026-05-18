@@ -1605,6 +1605,21 @@ app.post('/api/grades', authenticateToken, async (req: Request, res: Response): 
   }
 });
 
+
+const parentOwnsStudent = async (userId: string, studentId: string): Promise<boolean> => {
+  const parent = await prisma.parent.findUnique({
+    where: { userId },
+    select: {
+      children: {
+        where: { id: studentId },
+        select: { id: true },
+      },
+    },
+  });
+
+  return (parent?.children?.length ?? 0) > 0;
+};
+
 app.get('/api/student-summary/:studentId', authenticateToken, async (req: Request, res: Response): Promise<any> => {
   try {
     const userId = (req as any).user.userId;
@@ -1612,8 +1627,10 @@ app.get('/api/student-summary/:studentId', authenticateToken, async (req: Reques
     const studentId = req.params.studentId as string;
     const period = parseGradePeriod(req.query.period as string | undefined);
 
-    if (role !== 'ADMIN' && role !== 'TEACHER') {
-      return res.status(403).json({ error: 'Only admins and teachers can view student summaries.' });
+    if (role !== 'ADMIN' && role !== 'TEACHER' && role !== 'PARENT') {
+      return res.status(403).json({
+        error: 'Only admins, teachers, and parents can view student summaries.',
+      });
     }
 
     if (role === 'TEACHER') {
@@ -1628,6 +1645,16 @@ app.get('/api/student-summary/:studentId', authenticateToken, async (req: Reques
       if (!allowed) {
         return res.status(403).json({
           error: 'You can only view summaries for students in your own scope.',
+        });
+      }
+    }
+
+    if (role === 'PARENT') {
+      const allowed = await parentOwnsStudent(userId, studentId);
+
+      if (!allowed) {
+        return res.status(403).json({
+          error: 'You can only view student summaries for your own children.',
         });
       }
     }
@@ -1743,8 +1770,10 @@ app.get('/api/student-bulletin/:studentId', authenticateToken, async (req: Reque
     const studentId = req.params.studentId as string;
     const period = parseGradePeriod(req.query.period as string | undefined);
 
-    if (role !== 'ADMIN' && role !== 'TEACHER') {
-      return res.status(403).json({ error: 'Only admins and teachers can view bulletins.' });
+    if (role !== 'ADMIN' && role !== 'TEACHER' && role !== 'PARENT') {
+      return res.status(403).json({
+        error: 'Only admins, teachers, and parents can view student bulletins.',
+      });
     }
 
     if (role === 'TEACHER') {
@@ -1759,6 +1788,16 @@ app.get('/api/student-bulletin/:studentId', authenticateToken, async (req: Reque
       if (!allowed) {
         return res.status(403).json({
           error: 'You can only view bulletins for students in your own scope.',
+        });
+      }
+    }
+
+    if (role === 'PARENT') {
+      const allowed = await parentOwnsStudent(userId, studentId);
+
+      if (!allowed) {
+        return res.status(403).json({
+          error: 'You can only view student bulletins for your own children.',
         });
       }
     }
