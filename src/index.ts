@@ -1502,6 +1502,12 @@ app.post('/api/grades', authenticateToken, async (req: Request, res: Response): 
   select: publicUserSelect,
 },
         parent: true,
+        class: {
+          select: {
+            id: true,
+            academicYear: true,
+          },
+        },
       },
     });
 
@@ -1512,6 +1518,9 @@ app.post('/api/grades', authenticateToken, async (req: Request, res: Response): 
     if (!studentProfile.classId) {
       return res.status(400).json({ error: 'Student is not linked to a class.' });
     }
+
+    const gradeClassId = studentProfile.classId;
+    const gradeAcademicYear = studentProfile.class?.academicYear ?? null;
 
     if (role === 'TEACHER') {
       const teacherId = await getTeacherProfileId(userId);
@@ -1550,6 +1559,16 @@ app.post('/api/grades', authenticateToken, async (req: Request, res: Response): 
         subjectId,
         examType: normalizedExamType,
         period: gradePeriod,
+        OR: [
+          {
+            classId: gradeClassId,
+            academicYear: gradeAcademicYear,
+          },
+          {
+            classId: null,
+            academicYear: null,
+          },
+        ],
       },
     });
 
@@ -1559,6 +1578,8 @@ app.post('/api/grades', authenticateToken, async (req: Request, res: Response): 
       savedGrade = await prisma.grade.update({
         where: { id: existing.id },
         data: {
+          classId: gradeClassId,
+          academicYear: gradeAcademicYear,
           score: numericScore,
           comments: comments ? String(comments).trim() : null,
           period: gradePeriod,
@@ -1567,6 +1588,8 @@ app.post('/api/grades', authenticateToken, async (req: Request, res: Response): 
     } else {
       savedGrade = await prisma.grade.create({
         data: {
+          classId: gradeClassId,
+          academicYear: gradeAcademicYear,
           studentId,
           subjectId,
           examType: normalizedExamType,
@@ -1686,6 +1709,19 @@ app.get('/api/student-summary/:studentId', authenticateToken, async (req: Reques
       return res.status(404).json({ error: 'Student not found!' });
     }
 
+
+    const currentClassId = student.class?.id ?? student.classId ?? null;
+    const currentAcademicYear = student.class?.academicYear ?? null;
+    const gradesForSchoolSnapshot = student.grades.filter((grade) => {
+      const hasSchoolSnapshot = grade.classId !== null || grade.academicYear !== null;
+
+      if (!hasSchoolSnapshot) {
+        return true;
+      }
+
+      return grade.classId === currentClassId && grade.academicYear === currentAcademicYear;
+    });
+
     const gradeGroups = new Map<
       string,
       {
@@ -1696,7 +1732,7 @@ app.get('/api/student-summary/:studentId', authenticateToken, async (req: Reques
       }
     >();
 
-    for (const grade of student.grades) {
+    for (const grade of gradesForSchoolSnapshot) {
       const subjectId = grade.subjectId;
       const subjectName = grade.subject?.name ?? 'Unknown Subject';
       const coefficient = grade.subject?.coefficient ?? 1;
@@ -1741,7 +1777,7 @@ app.get('/api/student-summary/:studentId', authenticateToken, async (req: Reques
     const generalAverage =
       coefficientSum > 0 ? weightedSum / coefficientSum : null;
 
-    const allScores = student.grades.map((grade) => grade.score);
+    const allScores = gradesForSchoolSnapshot.map((grade) => grade.score);
     const bestScore = allScores.length > 0 ? Math.max(...allScores) : null;
 
     res.json({
@@ -1759,7 +1795,7 @@ app.get('/api/student-summary/:studentId', authenticateToken, async (req: Reques
           }
         : null,
       period,
-      gradesCount: student.grades.length,
+      gradesCount: gradesForSchoolSnapshot.length,
       bestScore,
       generalAverage,
       coefficientSum,
@@ -1835,6 +1871,19 @@ app.get('/api/student-bulletin/:studentId', authenticateToken, async (req: Reque
       return res.status(404).json({ error: 'Student not found!' });
     }
 
+
+    const currentClassId = student.class?.id ?? student.classId ?? null;
+    const currentAcademicYear = student.class?.academicYear ?? null;
+    const gradesForSchoolSnapshot = student.grades.filter((grade) => {
+      const hasSchoolSnapshot = grade.classId !== null || grade.academicYear !== null;
+
+      if (!hasSchoolSnapshot) {
+        return true;
+      }
+
+      return grade.classId === currentClassId && grade.academicYear === currentAcademicYear;
+    });
+
     const gradeGroups = new Map<
       string,
       {
@@ -1845,7 +1894,7 @@ app.get('/api/student-bulletin/:studentId', authenticateToken, async (req: Reque
       }
     >();
 
-    for (const grade of student.grades) {
+    for (const grade of gradesForSchoolSnapshot) {
       const subjectId = grade.subjectId;
       const subjectName = grade.subject?.name ?? 'Unknown Subject';
       const coefficient = grade.subject?.coefficient ?? 1;
@@ -1890,7 +1939,7 @@ app.get('/api/student-bulletin/:studentId', authenticateToken, async (req: Reque
     const generalAverage =
       coefficientSum > 0 ? weightedSum / coefficientSum : null;
 
-    const allScores = student.grades.map((grade) => grade.score);
+    const allScores = gradesForSchoolSnapshot.map((grade) => grade.score);
     const bestScore = allScores.length > 0 ? Math.max(...allScores) : null;
 
     const absencesCount = student.attendances.filter(
@@ -1912,7 +1961,7 @@ app.get('/api/student-bulletin/:studentId', authenticateToken, async (req: Reque
           }
         : null,
       period,
-      gradesCount: student.grades.length,
+      gradesCount: gradesForSchoolSnapshot.length,
       bestScore,
       generalAverage,
       coefficientSum,
@@ -1987,7 +2036,24 @@ app.get('/api/reports/grades', authenticateToken, async (req: Request, res: Resp
     }
 
     const rows = selectedClass.students.map((student) => {
-      const scores = student.grades.map((grade) => grade.score);
+      const schoolYearGrades = student.grades.filter((grade) => {
+
+        const hasSchoolSnapshot = grade.classId !== null || grade.academicYear !== null;
+
+
+        if (!hasSchoolSnapshot) {
+
+          return true;
+
+        }
+
+
+        return grade.classId === selectedClass.id && grade.academicYear === selectedClass.academicYear;
+
+      });
+
+
+      const scores = schoolYearGrades.map((grade) => grade.score);
 
       const average =
         scores.length > 0
@@ -2001,7 +2067,7 @@ app.get('/api/reports/grades', authenticateToken, async (req: Request, res: Resp
         studentId: student.id,
         studentName: `${student.user.firstName} ${student.user.lastName}`,
         email: student.user.email,
-        gradesCount: student.grades.length,
+        gradesCount: schoolYearGrades.length,
         average,
         bestScore,
         lowestScore,
