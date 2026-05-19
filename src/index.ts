@@ -1430,8 +1430,10 @@ app.get('/api/grades/:classId/:subjectId', authenticateToken, async (req: Reques
     const subjectId = req.params.subjectId as string;
     const period = parseGradePeriod(req.query.period as string | undefined);
 
-    if (role !== 'ADMIN' && role !== 'TEACHER') {
-      return res.status(403).json({ error: 'Only admins and teachers can view grades.' });
+    if (role !== 'TEACHER') {
+      return res.status(403).json({
+        error: 'Grade management is reserved for teachers.',
+      });
     }
 
     if (role === 'TEACHER') {
@@ -1477,8 +1479,10 @@ app.post('/api/grades', authenticateToken, async (req: Request, res: Response): 
     const role = (req as any).user.role;
     const { studentId, subjectId, examType, period, score, comments } = req.body;
 
-    if (role !== 'ADMIN' && role !== 'TEACHER') {
-      return res.status(403).json({ error: 'Only admins and teachers can save grades.' });
+    if (role !== 'TEACHER') {
+      return res.status(403).json({
+        error: 'Grade management is reserved for teachers.',
+      });
     }
 
     if (!studentId || !subjectId || !examType || score === undefined || score === null) {
