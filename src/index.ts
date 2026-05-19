@@ -1227,8 +1227,10 @@ app.get('/api/attendance/:scheduleId', authenticateToken, async (req: Request, r
     const scheduleId = req.params.scheduleId as string;
     const rawDate = req.query.date as string | undefined;
 
-    if (role !== 'ADMIN' && role !== 'TEACHER') {
-      return res.status(403).json({ error: 'Only admins and teachers can view attendance.' });
+    if (role !== 'TEACHER') {
+      return res.status(403).json({
+        error: 'Attendance and absence management is reserved for teachers.',
+      });
     }
 
     const schedule = await prisma.schedule.findUnique({
@@ -1296,8 +1298,10 @@ app.post('/api/attendance', authenticateToken, async (req: Request, res: Respons
     const role = (req as any).user.role;
     const { studentId, scheduleId, status, date } = req.body;
 
-    if (role !== 'ADMIN' && role !== 'TEACHER') {
-      return res.status(403).json({ error: 'Only admins and teachers can save attendance.' });
+    if (role !== 'TEACHER') {
+      return res.status(403).json({
+        error: 'Attendance and absence management is reserved for teachers.',
+      });
     }
 
     if (!studentId || !scheduleId || !status || !date) {
@@ -1918,158 +1922,10 @@ app.get('/api/student-bulletin/:studentId', authenticateToken, async (req: Reque
 });
 
 // REPORTS
-app.get('/api/reports/attendance', authenticateToken, async (req: Request, res: Response): Promise<any> => {
-  try {
-    const role = (req as any).user.role;
-
-    if (role !== 'ADMIN') {
-      return res.status(403).json({ error: 'Only admins can access attendance reports.' });
-    }
-
-    const classId = req.query.classId as string | undefined;
-    const from = req.query.from as string | undefined;
-    const to = req.query.to as string | undefined;
-
-    if (!classId || !from || !to) {
-      return res.status(400).json({
-        error: 'classId, from and to are required.',
-      });
-    }
-
-    const fromDate = new Date(from);
-    fromDate.setHours(0, 0, 0, 0);
-
-    const toDate = new Date(to);
-    toDate.setHours(23, 59, 59, 999);
-
-    if (Number.isNaN(fromDate.getTime()) || Number.isNaN(toDate.getTime())) {
-      return res.status(400).json({
-        error: 'from and to must be valid dates.',
-      });
-    }
-
-    const selectedClass = await prisma.class.findUnique({
-      where: { id: classId },
-      include: {
-        students: {
-          include: {
-            user: {
-              select: {
-                firstName: true,
-                lastName: true,
-                email: true,
-              },
-            },
-          },
-          orderBy: {
-            user: {
-              firstName: 'asc',
-            },
-          },
-        },
-      },
-    });
-
-    if (!selectedClass) {
-      return res.status(404).json({ error: 'Class not found.' });
-    }
-
-    const attendances = await prisma.attendance.findMany({
-      where: {
-        date: {
-          gte: fromDate,
-          lte: toDate,
-        },
-        schedule: {
-          classId,
-        },
-      },
-      include: {
-        student: {
-  include: {
-    user: {
-      select: publicUserSelect,
-    },
-  },
-},
-        schedule: {
-          include: {
-            subject: true,
-            class: true,
-          },
-        },
-      },
-      orderBy: [
-        { date: 'asc' },
-      ],
-    });
-
-    const rowsByStudent = new Map<
-      string,
-      {
-        studentId: string;
-        studentName: string;
-        email: string;
-        present: number;
-        absent: number;
-        late: number;
-        total: number;
-        absenceRate: number;
-      }
-    >();
-
-    for (const student of selectedClass.students) {
-      rowsByStudent.set(student.id, {
-        studentId: student.id,
-        studentName: `${student.user.firstName} ${student.user.lastName}`,
-        email: student.user.email,
-        present: 0,
-        absent: 0,
-        late: 0,
-        total: 0,
-        absenceRate: 0,
-      });
-    }
-
-    for (const attendance of attendances) {
-      const row = rowsByStudent.get(attendance.studentId);
-
-      if (!row) continue;
-
-      row.total += 1;
-
-      if (attendance.status === 'PRESENT') row.present += 1;
-      else if (attendance.status === 'ABSENT') row.absent += 1;
-      else if (attendance.status === 'LATE') row.late += 1;
-    }
-
-    const rows = Array.from(rowsByStudent.values()).map((row) => ({
-      ...row,
-      absenceRate:
-        row.total > 0 ? Math.round((row.absent / row.total) * 100) : 0,
-    }));
-
-    res.json({
-      class: {
-        id: selectedClass.id,
-        name: selectedClass.name,
-        academicYear: selectedClass.academicYear,
-      },
-      from,
-      to,
-      rows,
-      summary: {
-        students: rows.length,
-        totalPresent: rows.reduce((sum, row) => sum + row.present, 0),
-        totalAbsent: rows.reduce((sum, row) => sum + row.absent, 0),
-        totalLate: rows.reduce((sum, row) => sum + row.late, 0),
-        totalRecords: rows.reduce((sum, row) => sum + row.total, 0),
-      },
-    });
-  } catch (error) {
-    console.error('GET /api/reports/attendance error:', error);
-    res.status(500).json({ error: 'Failed to generate attendance report.' });
-  }
+app.get('/api/reports/attendance', authenticateToken, async (_req: Request, res: Response): Promise<any> => {
+  return res.status(403).json({
+    error: 'Attendance and absence reports are not part of manager duties.',
+  });
 });
 
 // REPORTS - GRADES
