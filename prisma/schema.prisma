@@ -53,15 +53,16 @@ model User {
 }
 
 model Student {
-  id             String   @id @default(uuid())
-  userId         String   @unique
-  user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  id             String          @id @default(uuid())
+  userId         String          @unique
+  user           User            @relation(fields: [userId], references: [id], onDelete: Cascade)
   dateOfBirth    DateTime
-  enrollmentDate DateTime @default(now())
+  enrollmentDate DateTime        @default(now())
   classId        String?
-  class          Class?   @relation(fields: [classId], references: [id], onDelete: SetNull)
+  class          Class?          @relation(fields: [classId], references: [id], onDelete: SetNull)
   parentId       String?
-  parent         Parent?  @relation(fields: [parentId], references: [id], onDelete: SetNull)
+  parent         Parent?         @relation(fields: [parentId], references: [id], onDelete: SetNull)
+  parentLinks    ParentStudent[]
 
   attendances Attendance[]
   grades      Grade[]
@@ -85,7 +86,21 @@ model Parent {
   user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
   address String?
 
-  children Student[]
+  children     Student[]
+  studentLinks ParentStudent[]
+}
+
+model ParentStudent {
+  id        String   @id @default(uuid())
+  parentId  String
+  parent    Parent   @relation(fields: [parentId], references: [id], onDelete: Cascade)
+  studentId String
+  student   Student  @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  @@unique([parentId, studentId])
+  @@index([parentId])
+  @@index([studentId])
 }
 
 model Class {

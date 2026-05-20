@@ -469,20 +469,7 @@ const getAllowedMessageRecipients = async (userId: string, role: string) => {
 
 
   if (role === Role.PARENT) {
-    const parent = await prisma.parent.findUnique({
-      where: { userId },
-      include: {
-        children: {
-          select: {
-            classId: true,
-          },
-        },
-      },
-    });
-
-    const classIds = uniqueStringValues(
-      (parent?.children ?? []).map((child) => child.classId)
-    );
+    const classIds = await getParentClassIds(userId);
 
     return prisma.user.findMany({
       where: {
@@ -1637,18 +1624,73 @@ app.post('/api/grades', authenticateToken, async (req: Request, res: Response): 
 });
 
 
-const parentOwnsStudent = async (userId: string, studentId: string): Promise<boolean> => {
+const getParentStudentIds = async (userId: string): Promise<string[]> => {
   const parent = await prisma.parent.findUnique({
     where: { userId },
     select: {
       children: {
-        where: { id: studentId },
         select: { id: true },
+      },
+      studentLinks: {
+        select: { studentId: true },
       },
     },
   });
 
-  return (parent?.children?.length ?? 0) > 0;
+  return uniqueStringValues([
+    ...(parent?.children ?? []).map((child) => child.id),
+    ...(parent?.studentLinks ?? []).map((link) => link.studentId),
+  ]);
+};
+
+const getParentClassIds = async (userId: string): Promise<string[]> => {
+  const studentIds = await getParentStudentIds(userId);
+
+  if (studentIds.length === 0) {
+    return [];
+  }
+
+  const students = await prisma.student.findMany({
+    where: {
+      id: {
+        in: studentIds,
+      },
+    },
+    select: {
+      classId: true,
+    },
+  });
+
+  return uniqueStringValues(students.map((student) => student.classId));
+};
+
+const getStudentParentUserIds = async (studentId: string): Promise<string[]> => {
+  const student = await prisma.student.findUnique({
+    where: { id: studentId },
+    select: {
+      parent: {
+        select: { userId: true },
+      },
+      parentLinks: {
+        select: {
+          parent: {
+            select: { userId: true },
+          },
+        },
+      },
+    },
+  });
+
+  return uniqueStringValues([
+    student?.parent?.userId,
+    ...((student?.parentLinks ?? []).map((link) => link.parent.userId)),
+  ]);
+};
+
+const parentOwnsStudent = async (userId: string, studentId: string): Promise<boolean> => {
+  const studentIds = await getParentStudentIds(userId);
+
+  return studentIds.includes(studentId);
 };
 
 app.get('/api/student-summary/:studentId', authenticateToken, async (req: Request, res: Response): Promise<any> => {
@@ -2486,23 +2528,33 @@ app.get('/api/my-assignments', authenticateToken, async (req: Request, res: Resp
 
 
     if (role === 'PARENT') {
-      const parent = await prisma.parent.findUnique({
-        where: { userId },
+      const studentIds = await getParentStudentIds(userId);
+
+      if (studentIds.length === 0) {
+        return res.json([]);
+      }
+
+      const children = await prisma.student.findMany({
+        where: {
+          id: {
+            in: studentIds,
+          },
+        },
         include: {
-          children: {
+          user: {
+            select: publicUserSelect,
+          },
+          submissions: {
             include: {
-              user: {
-  select: publicUserSelect,
-},
-              submissions: {
+              assignment: {
                 include: {
-                  assignment: {
+                  class: true,
+                  subject: true,
+                  teacher: {
                     include: {
-                      class: true,
-                      subject: true,
-                      teacher: { include: { user: {
-  select: publicUserSelect,
-} } },
+                      user: {
+                        select: publicUserSelect,
+                      },
                     },
                   },
                 },
@@ -2512,16 +2564,16 @@ app.get('/api/my-assignments', authenticateToken, async (req: Request, res: Resp
         },
       });
 
-      const children = (parent?.children ?? []).map((child) => ({
-        ...child,
-        submissions: [...child.submissions].sort(
-          (a, b) =>
-            new Date(a.assignment.dueDate).getTime() -
-            new Date(b.assignment.dueDate).getTime()
-        ),
-      }));
-
-      return res.json(children);
+      return res.json(
+        children.map((child) => ({
+          ...child,
+          submissions: [...child.submissions].sort(
+            (a, b) =>
+              new Date(a.assignment.dueDate).getTime() -
+              new Date(b.assignment.dueDate).getTime()
+          ),
+        }))
+      );
     }
 
     return res.status(403).json({
@@ -2942,14 +2994,7 @@ app.get('/api/my-announcements', authenticateToken, async (req: Request, res: Re
 
 
     if (role === 'PARENT') {
-      const parent = await prisma.parent.findUnique({
-        where: { userId },
-        include: { children: true },
-      });
-
-      const classIds = (parent?.children ?? [])
-        .map((child) => child.classId)
-        .filter(Boolean) as string[];
+      const classIds = await getParentClassIds(userId);
 
       const announcements = await prisma.announcement.findMany({
   where: {
@@ -3613,50 +3658,66 @@ app.get('/api/my-portal', authenticateToken, async (req: Request, res: Response)
     const role = (req as any).user.role;
  
     if (role === 'PARENT') {
-      // Find the parent and grab THEIR CHILD's info!
       const parentInfo = await prisma.parent.findUnique({
-  where: { userId: userId },
-  include: {
-    children: {
-      include: {
-        user: {
-          select: publicUserSelect,
-        },
-        class: {
-          include: {
-            schedules: {
+        where: { userId },
+      });
+
+      if (!parentInfo) {
+        return res.status(404).json({ error: 'Parent profile not found!' });
+      }
+
+      const studentIds = await getParentStudentIds(userId);
+
+      const children =
+        studentIds.length === 0
+          ? []
+          : await prisma.student.findMany({
+              where: {
+                id: {
+                  in: studentIds,
+                },
+              },
               include: {
-                subject: true,
-                teacher: {
+                user: {
+                  select: publicUserSelect,
+                },
+                class: {
                   include: {
-                    user: {
-                      select: publicUserSelect,
+                    schedules: {
+                      include: {
+                        subject: true,
+                        teacher: {
+                          include: {
+                            user: {
+                              select: publicUserSelect,
+                            },
+                          },
+                        },
+                      },
                     },
                   },
                 },
+                grades: {
+                  include: { subject: true },
+                  orderBy: { createdAt: 'desc' },
+                },
+                attendances: {
+                  include: {
+                    schedule: {
+                      include: { subject: true },
+                    },
+                  },
+                  orderBy: { date: 'desc' },
+                },
               },
-            },
-          },
-        },
-        grades: {
-          include: { subject: true },
-          orderBy: { createdAt: 'desc' },
-        },
-        attendances: {
-          include: {
-            schedule: {
-              include: { subject: true },
-            },
-          },
-          orderBy: { date: 'desc' },
-        },
-      },
-    },
-  },
-});
-      return res.json(parentInfo);
+            });
+
+      return res.json({
+        ...parentInfo,
+        children,
+      });
     }
-    
+
     res.status(403).json({
       error: 'Only parents can access the parent portal.',
     });
