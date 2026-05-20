@@ -312,7 +312,6 @@ const getAllowedAnnouncementAudiences = (
 
   if (role === "TEACHER") {
     return [
-      AnnouncementAudience.TEACHERS,
       AnnouncementAudience.CLASS,
     ];
   }
