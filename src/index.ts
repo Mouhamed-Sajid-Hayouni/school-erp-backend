@@ -15,6 +15,25 @@ import 'dotenv/config';
 const connectionString = process.env.DATABASE_URL;
 const JWT_SECRET = process.env.JWT_SECRET;
 const PORT = Number(process.env.PORT || 5000);
+const rawCorsOrigins = process.env.CORS_ORIGIN || process.env.FRONTEND_URL || "";
+const allowedCorsOrigins = rawCorsOrigins
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+
+const corsOptions = {
+  origin(
+    origin: string | undefined,
+    callback: (error: Error | null, allow?: boolean) => void
+  ) {
+    if (!origin || allowedCorsOrigins.length === 0 || allowedCorsOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+
+    return callback(new Error("Not allowed by CORS"));
+  },
+  credentials: true,
+};
 
 const CLOUDINARY_CLOUD_NAME = process.env.CLOUDINARY_CLOUD_NAME;
 const CLOUDINARY_API_KEY = process.env.CLOUDINARY_API_KEY;
@@ -120,7 +139,7 @@ const parseGradePeriod = (value?: string): GradePeriod => {
 };
 
 
-app.use(cors());
+app.use(cors(corsOptions));
 app.use('/uploads', express.static(uploadsDir));
 app.use(express.json());
 
@@ -3884,4 +3903,4 @@ app.put(
   }
 );
 
-app.listen(PORT, () => console.log(`ðŸš€ Server is running on http://localhost:${PORT}`));
+app.listen(PORT, () => console.log(`Server is running on port ${PORT}`));
