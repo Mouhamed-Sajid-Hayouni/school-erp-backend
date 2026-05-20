@@ -1591,9 +1591,7 @@ app.post('/api/grades', authenticateToken, async (req: Request, res: Response): 
       where: { id: subjectId },
     });
 
-    const notificationUserIds = [
-      studentProfile.parent?.userId,
-    ].filter(Boolean) as string[];
+    const notificationUserIds = await getStudentParentUserIds(studentId);
 
     await createNotificationsForUserIds(
       notificationUserIds,
@@ -2339,11 +2337,13 @@ app.post('/api/assignments', authenticateToken, async (req: Request, res: Respon
       },
     });
 
+    const parentNotificationUserIds = uniqueStringValues(
+      (await Promise.all(studentProfiles.map((student) => getStudentParentUserIds(student.id)))).flat()
+    );
+
     const notificationUserIds = [
       ...studentProfiles.map((student) => student.userId),
-      ...studentProfiles
-        .map((student) => student.parent?.userId)
-        .filter(Boolean) as string[],
+      ...parentNotificationUserIds,
     ];
 
     await createNotificationsForUserIds(
@@ -2614,12 +2614,9 @@ app.put('/api/assignment-submissions/:id', authenticateToken, async (req: Reques
         error: 'Only parents can update assignment submissions for their children.',
       });
     }
+    const allowed = await parentOwnsStudent(userId, submission.studentId);
 
-    const parent = await prisma.parent.findUnique({
-      where: { userId },
-    });
-
-    if (!parent || submission.student.parentId !== parent.id) {
+    if (!allowed) {
       return res.status(403).json({
         error: 'You can only update your child assignments.',
       });
@@ -2834,9 +2831,9 @@ app.post('/api/announcements', authenticateToken, async (req: Request, res: Resp
         },
       });
 
-      notificationUserIds = students
-        .map((student) => student.parent?.userId)
-        .filter(Boolean) as string[];
+      notificationUserIds = uniqueStringValues(
+        (await Promise.all(students.map((student) => getStudentParentUserIds(student.id)))).flat()
+      );
     }
 
     await createNotificationsForUserIds(
@@ -3152,9 +3149,7 @@ app.post('/api/notify-bulletin/:studentId', authenticateToken, async (req: Reque
       return res.status(404).json({ error: 'Student not found!' });
     }
 
-    const notificationUserIds = [
-      student.parent?.userId,
-    ].filter(Boolean) as string[];
+    const notificationUserIds = await getStudentParentUserIds(studentId);
 
     await createNotificationsForUserIds(
       notificationUserIds,
