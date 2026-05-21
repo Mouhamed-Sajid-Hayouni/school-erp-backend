@@ -1,4 +1,4 @@
-import express, { Request, Response, NextFunction } from 'express';
+﻿import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import path from 'path';
 import fs from 'fs';
@@ -350,6 +350,7 @@ const getAllowedMessageRecipients = async (userId: string, role: string) => {
       where: {
         isActive: true,
         id: { not: userId },
+        role: { not: Role.STUDENT },
       },
       select: messageUserSelect,
       orderBy: [
@@ -452,7 +453,7 @@ const getAllowedMessageRecipients = async (userId: string, role: string) => {
   return [];
 };
 
-app.get('/', (req: Request, res: Response) => res.send('ðŸŽ‰ API is running!'));
+app.get('/', (req: Request, res: Response) => res.send('Ã°Å¸Å½â€° API is running!'));
 
 app.get('/api/health', async (req: Request, res: Response): Promise<any> => {
   try {
