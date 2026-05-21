@@ -2306,10 +2306,7 @@ app.post('/api/assignments', authenticateToken, async (req: Request, res: Respon
       (await Promise.all(studentProfiles.map((student) => getStudentParentUserIds(student.id)))).flat()
     );
 
-    const notificationUserIds = [
-      ...studentProfiles.map((student) => student.userId),
-      ...parentNotificationUserIds,
-    ];
+    const notificationUserIds = parentNotificationUserIds;
 
     await createNotificationsForUserIds(
       notificationUserIds,
@@ -3851,3 +3848,4 @@ app.put(
 );
 
 app.listen(PORT, () => console.log(`Server is running on port ${PORT}`));
+
