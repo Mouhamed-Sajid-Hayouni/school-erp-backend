@@ -1382,21 +1382,42 @@ app.get('/api/grades/:classId/:subjectId', authenticateToken, async (req: Reques
       }
     }
 
-    const students = await prisma.student.findMany({
-  where: { classId },
-  include: {
-    user: {
-      select: publicUserSelect,
-    },
-    grades: {
-      where: {
-        subjectId,
-        period,
+    const selectedClass = await prisma.class.findUnique({
+      where: { id: classId },
+      select: {
+        id: true,
+        academicYear: true,
       },
-    },
-  },
-});
+    });
 
+    if (!selectedClass) {
+      return res.status(404).json({ error: 'Class not found!' });
+    }
+
+    const students = await prisma.student.findMany({
+      where: { classId },
+      include: {
+        user: {
+          select: publicUserSelect,
+        },
+        grades: {
+          where: {
+            subjectId,
+            period,
+            OR: [
+              {
+                classId: selectedClass.id,
+                academicYear: selectedClass.academicYear,
+              },
+              {
+                classId: null,
+                academicYear: null,
+              },
+            ],
+          },
+        },
+      },
+    });
     res.json(students);
   } catch (error) {
     console.error('GET /api/grades error:', error);
