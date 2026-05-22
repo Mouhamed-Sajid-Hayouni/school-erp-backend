@@ -568,7 +568,9 @@ app.post('/api/login', async (req: Request, res: Response): Promise<any> => {
     }
 
     if (!user.isActive) {
-      return res.status(403).json({ error: 'This account is inactive.' });
+      return res.status(403).json({
+        error: 'This account is pending school approval or inactive.',
+      });
     }
 
     if (user.role === Role.STUDENT) {
@@ -607,10 +609,109 @@ app.post('/api/login', async (req: Request, res: Response): Promise<any> => {
 });
 
 // USERS
-app.post('/api/register', authenticateToken, requireAdmin, async (_req: Request, res: Response): Promise<any> => {
-  return res.status(403).json({
-    error: 'Managers cannot create or modify user accounts.',
-  });
+app.post('/api/register', async (req: Request, res: Response): Promise<any> => {
+  try {
+    const normalizedEmail = String(req.body.email ?? '').trim().toLowerCase();
+    const normalizedPassword = String(req.body.password ?? '');
+    const normalizedFirstName = String(req.body.firstName ?? '').trim();
+    const normalizedLastName = String(req.body.lastName ?? '').trim();
+    const normalizedPhone = String(req.body.phone ?? '').trim();
+    const normalizedRole = String(req.body.role ?? '').trim().toUpperCase();
+    const normalizedAddress = String(req.body.address ?? '').trim();
+    const normalizedSpecialty = String(req.body.specialty ?? '').trim();
+
+    const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+    if (!normalizedEmail || !normalizedPassword || !normalizedFirstName || !normalizedLastName || !normalizedRole) {
+      return res.status(400).json({
+        error: 'email, password, firstName, lastName and role are required!',
+      });
+    }
+
+    if (!emailPattern.test(normalizedEmail)) {
+      return res.status(400).json({ error: 'Email must be valid!' });
+    }
+
+    if (normalizedPassword.length < 8) {
+      return res.status(400).json({
+        error: 'Password must contain at least 8 characters!',
+      });
+    }
+
+    if (normalizedRole === Role.STUDENT) {
+      return res.status(403).json({
+        error: 'Student accounts cannot be created directly. Students remain school records only.',
+      });
+    }
+
+    if (normalizedRole !== Role.PARENT && normalizedRole !== Role.TEACHER) {
+      return res.status(403).json({
+        error: 'Only parents and teachers can request accounts.',
+      });
+    }
+
+    const existingUser = await prisma.user.findUnique({
+      where: { email: normalizedEmail },
+      select: { id: true },
+    });
+
+    if (existingUser) {
+      return res.status(409).json({
+        error: 'An account with this email already exists.',
+      });
+    }
+
+    const passwordHash = await bcrypt.hash(normalizedPassword, 10);
+    const role = normalizedRole as Role;
+
+    const data: Prisma.UserCreateInput = {
+      email: normalizedEmail,
+      passwordHash,
+      firstName: normalizedFirstName,
+      lastName: normalizedLastName,
+      phone: normalizedPhone || null,
+      role,
+      isActive: false,
+    };
+
+    if (role === Role.PARENT) {
+      data.parentProfile = {
+        create: {
+          address: normalizedAddress || null,
+        },
+      };
+    }
+
+    if (role === Role.TEACHER) {
+      data.teacherProfile = {
+        create: {
+          specialty: normalizedSpecialty || 'A valider',
+        },
+      };
+    }
+
+    const created = await prisma.user.create({
+      data,
+      select: {
+        id: true,
+        email: true,
+        firstName: true,
+        lastName: true,
+        phone: true,
+        role: true,
+        isActive: true,
+        createdAt: true,
+      },
+    });
+
+    res.status(201).json({
+      message: 'Registration request submitted. Please wait for school approval.',
+      user: created,
+    });
+  } catch (error) {
+    console.error('POST /api/register error:', error);
+    res.status(500).json({ error: 'Failed to submit registration request' });
+  }
 });
 
 app.get('/api/users', authenticateToken, requireAdmin, async (req: Request, res: Response) => {
