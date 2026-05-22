@@ -730,6 +730,117 @@ app.get('/api/users', authenticateToken, requireAdmin, async (req: Request, res:
   }
 });
 
+
+app.get('/api/users/pending-requests', authenticateToken, requireAdmin, async (_req: Request, res: Response): Promise<any> => {
+  try {
+    const pendingRequests = await prisma.user.findMany({
+      where: {
+        isActive: false,
+        role: {
+          in: [Role.PARENT, Role.TEACHER],
+        },
+      },
+      select: {
+        id: true,
+        email: true,
+        firstName: true,
+        lastName: true,
+        phone: true,
+        role: true,
+        isActive: true,
+        profileImage: true,
+        createdAt: true,
+        parentProfile: {
+          select: {
+            address: true,
+          },
+        },
+        teacherProfile: {
+          select: {
+            specialty: true,
+          },
+        },
+      },
+      orderBy: {
+        createdAt: 'asc',
+      },
+    });
+
+    res.json(pendingRequests);
+  } catch (error) {
+    console.error('GET /api/users/pending-requests error:', error);
+    res.status(500).json({ error: 'Failed to fetch pending registration requests' });
+  }
+});
+
+app.post('/api/users/:id/approve-request', authenticateToken, requireAdmin, async (req: Request, res: Response): Promise<any> => {
+  try {
+    const userId = req.params.id as string;
+
+    const pendingUser = await prisma.user.findUnique({
+      where: { id: userId },
+      select: {
+        id: true,
+        email: true,
+        firstName: true,
+        lastName: true,
+        role: true,
+        isActive: true,
+      },
+    });
+
+    if (!pendingUser) {
+      return res.status(404).json({ error: 'Registration request not found.' });
+    }
+
+    if (pendingUser.role !== Role.PARENT && pendingUser.role !== Role.TEACHER) {
+      return res.status(403).json({
+        error: 'Only parent and teacher registration requests can be approved.',
+      });
+    }
+
+    if (pendingUser.isActive) {
+      return res.status(400).json({ error: 'This account is already active.' });
+    }
+
+    const approvedUser = await prisma.user.update({
+      where: { id: userId },
+      data: {
+        isActive: true,
+      },
+      select: {
+        id: true,
+        email: true,
+        firstName: true,
+        lastName: true,
+        phone: true,
+        role: true,
+        isActive: true,
+        profileImage: true,
+        createdAt: true,
+      },
+    });
+
+    await createAuditLog(req, {
+      action: 'APPROVE_REGISTRATION_REQUEST',
+      entity: 'User',
+      entityId: approvedUser.id,
+      details: {
+        email: approvedUser.email,
+        role: approvedUser.role,
+      },
+    });
+
+    res.json({
+      message: 'Registration request approved.',
+      user: approvedUser,
+    });
+  } catch (error) {
+    console.error('POST /api/users/:id/approve-request error:', error);
+    res.status(500).json({ error: 'Failed to approve registration request' });
+  }
+});
+
 app.post(
   '/api/users/:id/profile-image',
   authenticateToken,
