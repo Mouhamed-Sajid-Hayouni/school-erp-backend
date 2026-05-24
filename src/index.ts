@@ -841,6 +841,63 @@ app.post('/api/users/:id/approve-request', authenticateToken, requireAdmin, asyn
   }
 });
 
+
+app.post('/api/users/:id/reject-request', authenticateToken, requireAdmin, async (req: Request, res: Response): Promise<any> => {
+  try {
+    const userId = req.params.id as string;
+
+    const pendingUser = await prisma.user.findUnique({
+      where: { id: userId },
+      select: {
+        id: true,
+        email: true,
+        firstName: true,
+        lastName: true,
+        role: true,
+        isActive: true,
+      },
+    });
+
+    if (!pendingUser) {
+      return res.status(404).json({ error: 'Registration request not found.' });
+    }
+
+    if (pendingUser.role !== Role.PARENT && pendingUser.role !== Role.TEACHER) {
+      return res.status(400).json({ error: 'Only parent or teacher registration requests can be rejected.' });
+    }
+
+    if (pendingUser.isActive) {
+      return res.status(400).json({ error: 'Active accounts cannot be rejected as pending requests.' });
+    }
+
+    await prisma.$transaction([
+      prisma.parent.deleteMany({ where: { userId } }),
+      prisma.teacher.deleteMany({ where: { userId } }),
+      prisma.user.delete({ where: { id: userId } }),
+    ]);
+
+    await createAuditLog(req, {
+      action: 'REJECT_REGISTRATION_REQUEST',
+      entity: 'User',
+      entityId: pendingUser.id,
+      details: {
+        email: pendingUser.email,
+        firstName: pendingUser.firstName,
+        lastName: pendingUser.lastName,
+        role: pendingUser.role,
+      },
+    });
+
+    res.json({
+      message: 'Registration request rejected.',
+      user: pendingUser,
+    });
+  } catch (error) {
+    console.error('POST /api/users/:id/reject-request error:', error);
+    res.status(500).json({ error: 'Failed to reject registration request' });
+  }
+});
+
 app.post(
   '/api/users/:id/profile-image',
   authenticateToken,
