@@ -3369,8 +3369,8 @@ app.put('/api/notifications/:id/read', authenticateToken, async (req: Request, r
 
 app.post('/api/notify-bulletin/:studentId', authenticateToken, async (req: Request, res: Response): Promise<any> => {
   try {
-    if (!isAdminOrTeacher(req)) {
-      return res.status(403).json({ error: 'Only admins and teachers can publish bulletin notifications.' });
+    if ((req as any).user.role !== Role.TEACHER) {
+      return res.status(403).json({ error: 'Only teachers can publish bulletin notifications.' });
     }
 
     const userId = (req as any).user.userId;
