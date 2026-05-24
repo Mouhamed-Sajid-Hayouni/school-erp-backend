@@ -608,6 +608,56 @@ app.post('/api/login', async (req: Request, res: Response): Promise<any> => {
   }
 });
 
+
+app.post('/api/password-reset/request', async (req: Request, res: Response): Promise<any> => {
+  try {
+    const normalizedEmail = String(req.body.email ?? '').trim().toLowerCase();
+    const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+    if (!normalizedEmail || !emailPattern.test(normalizedEmail)) {
+      return res.status(400).json({ error: 'Email must be valid!' });
+    }
+
+    const user = await prisma.user.findUnique({
+      where: { email: normalizedEmail },
+      select: {
+        id: true,
+        email: true,
+        firstName: true,
+        lastName: true,
+        role: true,
+        isActive: true,
+      },
+    });
+
+    if (
+      user &&
+      user.isActive &&
+      (user.role === Role.PARENT || user.role === Role.TEACHER)
+    ) {
+      await createAuditLog(req, {
+        action: 'REQUEST_PASSWORD_RESET',
+        entity: 'User',
+        entityId: user.id,
+        details: {
+          email: user.email,
+          firstName: user.firstName,
+          lastName: user.lastName,
+          role: user.role,
+          note: 'User requested password reset guidance.',
+        },
+      });
+    }
+
+    res.json({
+      message: 'If this email belongs to an active parent or teacher account, a password reset request was submitted. Please contact school administration.',
+    });
+  } catch (error) {
+    console.error('POST /api/password-reset/request error:', error);
+    res.status(500).json({ error: 'Failed to submit password reset request' });
+  }
+});
+
 // USERS
 app.post('/api/register', async (req: Request, res: Response): Promise<any> => {
   try {
