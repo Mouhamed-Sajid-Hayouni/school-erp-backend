@@ -2483,8 +2483,8 @@ app.get('/api/assignments', authenticateToken, async (req: Request, res: Respons
 
 app.post('/api/assignments', authenticateToken, async (req: Request, res: Response): Promise<any> => {
   try {
-    if (!isAdminOrTeacher(req)) {
-      return res.status(403).json({ error: 'Only admins and teachers can create assignments.' });
+    if ((req as any).user.role !== Role.TEACHER) {
+      return res.status(403).json({ error: 'Only teachers can create assignments.' });
     }
 
     const userId = (req as any).user.userId;
@@ -2549,28 +2549,6 @@ app.post('/api/assignments', authenticateToken, async (req: Request, res: Respon
       resolvedTeacherId = teacherIdFromToken;
     }
 
-    if (role === 'ADMIN') {
-  if (!resolvedTeacherId) {
-    return res.status(400).json({
-      error: 'teacherId is required when an admin creates an assignment.',
-    });
-  }
-
-  const teacherScope = await prisma.schedule.findFirst({
-    where: {
-      teacherId: resolvedTeacherId,
-      classId,
-      subjectId,
-    },
-    select: { id: true },
-  });
-
-  if (!teacherScope) {
-    return res.status(400).json({
-      error: 'Selected teacher is not scheduled for this class and subject.',
-    });
-  }
-}
 
     const created = await prisma.assignment.create({
       data: {
@@ -2657,8 +2635,8 @@ app.post('/api/assignments', authenticateToken, async (req: Request, res: Respon
 
 app.put('/api/assignments/:id', authenticateToken, async (req: Request, res: Response): Promise<any> => {
   try {
-    if (!isAdminOrTeacher(req)) {
-      return res.status(403).json({ error: 'Only admins and teachers can update assignments.' });
+    if ((req as any).user.role !== Role.TEACHER) {
+      return res.status(403).json({ error: 'Only teachers can update assignments.' });
     }
 
     const userId = (req as any).user.userId;
@@ -2740,8 +2718,8 @@ app.put('/api/assignments/:id', authenticateToken, async (req: Request, res: Res
 
 app.delete('/api/assignments/:id', authenticateToken, async (req: Request, res: Response): Promise<any> => {
   try {
-    if (!isAdminOrTeacher(req)) {
-      return res.status(403).json({ error: 'Only admins and teachers can delete assignments.' });
+    if ((req as any).user.role !== Role.TEACHER) {
+      return res.status(403).json({ error: 'Only teachers can delete assignments.' });
     }
 
     const userId = (req as any).user.userId;
