@@ -7,3 +7,4 @@ node_modules
 dist/
 uploads/
 demo-profile.png
+.env.local
