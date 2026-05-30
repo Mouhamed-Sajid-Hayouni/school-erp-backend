@@ -1,4 +1,4 @@
-﻿import express, { Request, Response, NextFunction } from 'express';
+import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import path from 'path';
 import fs from 'fs';
@@ -1195,6 +1195,314 @@ app.get('/api/teachers', authenticateToken, requireAdmin, async (req: Request, r
     res.status(500).json({ error: "Failed" });
   }
 });
+
+// TEACHER ABSENCES - ADMIN ONLY
+const teacherAbsenceStatuses = ['JUSTIFIED', 'UNJUSTIFIED'] as const;
+type TeacherAbsenceStatusInput = (typeof teacherAbsenceStatuses)[number];
+
+const parseTeacherAbsenceStatus = (value: unknown): TeacherAbsenceStatusInput | null => {
+  const normalized = String(value ?? 'UNJUSTIFIED').trim().toUpperCase();
+
+  if (teacherAbsenceStatuses.includes(normalized as TeacherAbsenceStatusInput)) {
+    return normalized as TeacherAbsenceStatusInput;
+  }
+
+  return null;
+};
+
+const parseTeacherAbsenceDate = (value: unknown): Date | null => {
+  const raw = String(value ?? '').trim();
+
+  if (!raw) {
+    return null;
+  }
+
+  const dateMatch = /^(\d{4})-(\d{2})-(\d{2})$/.exec(raw);
+  const date = dateMatch
+    ? new Date(Date.UTC(Number(dateMatch[1]), Number(dateMatch[2]) - 1, Number(dateMatch[3])))
+    : new Date(raw);
+
+  if (Number.isNaN(date.getTime())) {
+    return null;
+  }
+
+  date.setUTCHours(0, 0, 0, 0);
+  return date;
+};
+
+const addUtcDays = (date: Date, days: number): Date => {
+  const nextDate = new Date(date);
+  nextDate.setUTCDate(nextDate.getUTCDate() + days);
+  return nextDate;
+};
+
+const teacherAbsenceInclude = {
+  teacher: {
+    include: {
+      user: {
+        select: publicUserSelect,
+      },
+    },
+  },
+  createdBy: {
+    select: publicUserSelect,
+  },
+};
+
+const findActiveTeacherForAbsence = async (teacherId: string) => {
+  return prisma.teacher.findFirst({
+    where: {
+      id: teacherId,
+      user: {
+        role: Role.TEACHER,
+        isActive: true,
+      },
+    },
+    include: {
+      user: {
+        select: publicUserSelect,
+      },
+    },
+  });
+};
+
+app.get('/api/teacher-absences', authenticateToken, requireAdmin, async (req: Request, res: Response): Promise<any> => {
+  try {
+    const teacherId = String(req.query.teacherId ?? '').trim();
+    const rawFrom = String(req.query.from ?? '').trim();
+    const rawTo = String(req.query.to ?? '').trim();
+
+    const fromDate = rawFrom ? parseTeacherAbsenceDate(rawFrom) : null;
+    const toDate = rawTo ? parseTeacherAbsenceDate(rawTo) : null;
+
+    if (rawFrom && !fromDate) {
+      return res.status(400).json({ error: 'Invalid from date.' });
+    }
+
+    if (rawTo && !toDate) {
+      return res.status(400).json({ error: 'Invalid to date.' });
+    }
+
+    const where: any = {};
+
+    if (teacherId) {
+      where.teacherId = teacherId;
+    }
+
+    if (fromDate || toDate) {
+      where.date = {};
+
+      if (fromDate) {
+        where.date.gte = fromDate;
+      }
+
+      if (toDate) {
+        where.date.lt = addUtcDays(toDate, 1);
+      }
+    }
+
+    const absences = await prisma.teacherAbsence.findMany({
+      where,
+      include: teacherAbsenceInclude,
+      orderBy: [
+        { date: 'desc' },
+        { createdAt: 'desc' },
+      ],
+    });
+
+    res.json(absences);
+  } catch (error) {
+    console.error('GET /api/teacher-absences error:', error);
+    res.status(500).json({ error: 'Failed to fetch teacher absences.' });
+  }
+});
+
+app.post('/api/teacher-absences', authenticateToken, requireAdmin, async (req: Request, res: Response): Promise<any> => {
+  try {
+    const actorId = (req as any).user.userId;
+    const teacherId = String(req.body.teacherId ?? '').trim();
+    const date = parseTeacherAbsenceDate(req.body.date);
+    const status = parseTeacherAbsenceStatus(req.body.status);
+    const reason = String(req.body.reason ?? '').trim() || null;
+
+    if (!teacherId || !date) {
+      return res.status(400).json({ error: 'Teacher and date are required.' });
+    }
+
+    if (!status) {
+      return res.status(400).json({ error: 'Invalid teacher absence status.' });
+    }
+
+    const teacher = await findActiveTeacherForAbsence(teacherId);
+
+    if (!teacher) {
+      return res.status(404).json({ error: 'Teacher not found.' });
+    }
+
+    const absence = await prisma.teacherAbsence.create({
+      data: {
+        teacherId,
+        date,
+        status,
+        reason,
+        createdById: actorId,
+      },
+      include: teacherAbsenceInclude,
+    });
+
+    await prisma.auditLog.create({
+      data: {
+        actorId,
+        actorRole: Role.ADMIN,
+        action: 'CREATE_TEACHER_ABSENCE',
+        entity: 'TeacherAbsence',
+        entityId: absence.id,
+        details: {
+          teacherId,
+          teacherName: `${teacher.user.firstName} ${teacher.user.lastName}`,
+          date: date.toISOString().slice(0, 10),
+          status,
+        },
+      },
+    });
+
+    res.status(201).json(absence);
+  } catch (error) {
+    if ((error as any)?.code === 'P2002') {
+      return res.status(409).json({ error: 'Teacher absence already exists for this date.' });
+    }
+
+    console.error('POST /api/teacher-absences error:', error);
+    res.status(500).json({ error: 'Failed to create teacher absence.' });
+  }
+});
+
+app.put('/api/teacher-absences/:id', authenticateToken, requireAdmin, async (req: Request, res: Response): Promise<any> => {
+  try {
+    const actorId = (req as any).user.userId;
+    const absenceId = req.params.id as string;
+
+    const existing = await prisma.teacherAbsence.findUnique({
+      where: { id: absenceId },
+    });
+
+    if (!existing) {
+      return res.status(404).json({ error: 'Teacher absence not found.' });
+    }
+
+    const data: any = {};
+
+    if (req.body.teacherId !== undefined) {
+      const teacherId = String(req.body.teacherId ?? '').trim();
+
+      if (!teacherId) {
+        return res.status(400).json({ error: 'Teacher is required.' });
+      }
+
+      const teacher = await findActiveTeacherForAbsence(teacherId);
+
+      if (!teacher) {
+        return res.status(404).json({ error: 'Teacher not found.' });
+      }
+
+      data.teacherId = teacherId;
+    }
+
+    if (req.body.date !== undefined) {
+      const date = parseTeacherAbsenceDate(req.body.date);
+
+      if (!date) {
+        return res.status(400).json({ error: 'Invalid teacher absence date.' });
+      }
+
+      data.date = date;
+    }
+
+    if (req.body.status !== undefined) {
+      const status = parseTeacherAbsenceStatus(req.body.status);
+
+      if (!status) {
+        return res.status(400).json({ error: 'Invalid teacher absence status.' });
+      }
+
+      data.status = status;
+    }
+
+    if (req.body.reason !== undefined) {
+      data.reason = String(req.body.reason ?? '').trim() || null;
+    }
+
+    const absence = await prisma.teacherAbsence.update({
+      where: { id: absenceId },
+      data,
+      include: teacherAbsenceInclude,
+    });
+
+    await prisma.auditLog.create({
+      data: {
+        actorId,
+        actorRole: Role.ADMIN,
+        action: 'UPDATE_TEACHER_ABSENCE',
+        entity: 'TeacherAbsence',
+        entityId: absence.id,
+        details: {
+          teacherId: absence.teacherId,
+          date: absence.date.toISOString().slice(0, 10),
+          status: absence.status,
+        },
+      },
+    });
+
+    res.json(absence);
+  } catch (error) {
+    if ((error as any)?.code === 'P2002') {
+      return res.status(409).json({ error: 'Teacher absence already exists for this date.' });
+    }
+
+    console.error('PUT /api/teacher-absences/:id error:', error);
+    res.status(500).json({ error: 'Failed to update teacher absence.' });
+  }
+});
+
+app.delete('/api/teacher-absences/:id', authenticateToken, requireAdmin, async (req: Request, res: Response): Promise<any> => {
+  try {
+    const actorId = (req as any).user.userId;
+    const absenceId = req.params.id as string;
+
+    const existing = await prisma.teacherAbsence.findUnique({
+      where: { id: absenceId },
+    });
+
+    if (!existing) {
+      return res.status(404).json({ error: 'Teacher absence not found.' });
+    }
+
+    await prisma.teacherAbsence.delete({
+      where: { id: absenceId },
+    });
+
+    await prisma.auditLog.create({
+      data: {
+        actorId,
+        actorRole: Role.ADMIN,
+        action: 'DELETE_TEACHER_ABSENCE',
+        entity: 'TeacherAbsence',
+        entityId: absenceId,
+        details: {
+          teacherId: existing.teacherId,
+          date: existing.date.toISOString().slice(0, 10),
+          status: existing.status,
+        },
+      },
+    });
+
+    res.json({ message: 'Teacher absence deleted.' });
+  } catch (error) {
+    console.error('DELETE /api/teacher-absences/:id error:', error);
+    res.status(500).json({ error: 'Failed to delete teacher absence.' });
+  }
+});
+
 app.get('/api/schedules', authenticateToken, async (req: Request, res: Response): Promise<any> => {
   try {
     const userId = (req as any).user.userId;

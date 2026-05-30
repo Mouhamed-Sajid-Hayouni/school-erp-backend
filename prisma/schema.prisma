@@ -27,6 +27,11 @@ enum AnnouncementAudience {
   CLASS
 }
 
+enum TeacherAbsenceStatus {
+  JUSTIFIED
+  UNJUSTIFIED
+}
+
 model User {
   id           String   @id @default(uuid())
   email        String   @unique
@@ -47,6 +52,7 @@ model User {
   announcementsCreated Announcement[]
   notifications        Notification[]
   auditLogs            AuditLog[]
+  teacherAbsencesCreated TeacherAbsence[] @relation("TeacherAbsencesCreated")
 
   conversationParticipants ConversationParticipant[]
   sentMessages             Message[]
@@ -78,6 +84,7 @@ model Teacher {
 
   schedules   Schedule[]
   assignments Assignment[]
+  absences TeacherAbsence[]
 }
 
 model Parent {
@@ -153,6 +160,29 @@ model Attendance {
   date    DateTime @default(now())
   status  String
   remarks String?
+}
+
+model TeacherAbsence {
+  id String @id @default(uuid())
+
+  teacherId String
+  teacher   Teacher @relation(fields: [teacherId], references: [id], onDelete: Cascade)
+
+  date   DateTime
+  status TeacherAbsenceStatus @default(UNJUSTIFIED)
+  reason String?
+
+  createdById String?
+  createdBy   User?   @relation("TeacherAbsencesCreated", fields: [createdById], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([teacherId, date])
+  @@index([teacherId])
+  @@index([date])
+  @@index([status])
+  @@index([createdById])
 }
 
 model Grade {
