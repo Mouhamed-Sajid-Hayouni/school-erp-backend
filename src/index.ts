@@ -1174,6 +1174,164 @@ app.delete('/api/users/:id', authenticateToken, requireAdmin, async (_req: Reque
   });
 });
 
+
+app.get('/api/students', authenticateToken, requireAdmin, async (_req: Request, res: Response): Promise<any> => {
+  try {
+    const students = await prisma.student.findMany({
+      include: {
+        user: {
+          select: publicUserSelect,
+        },
+        class: true,
+        parent: {
+          include: {
+            user: {
+              select: publicUserSelect,
+            },
+          },
+        },
+        parentLinks: {
+          include: {
+            parent: {
+              include: {
+                user: {
+                  select: publicUserSelect,
+                },
+              },
+            },
+          },
+        },
+      },
+      orderBy: {
+        enrollmentDate: 'desc',
+      },
+    });
+
+    res.json(students);
+  } catch (error) {
+    console.error('GET /api/students error:', error);
+    res.status(500).json({ error: 'Failed to fetch students' });
+  }
+});
+
+app.post('/api/students', authenticateToken, requireAdmin, async (req: Request, res: Response): Promise<any> => {
+  try {
+    const firstName = String(req.body.firstName ?? '').trim();
+    const lastName = String(req.body.lastName ?? '').trim();
+    const phone = String(req.body.phone ?? '').trim();
+    const dateOfBirthValue = String(req.body.dateOfBirth ?? '').trim();
+    const classId = String(req.body.classId ?? '').trim();
+
+    if (!firstName || !lastName || !dateOfBirthValue || !classId) {
+      return res.status(400).json({
+        error: 'firstName, lastName, dateOfBirth and classId are required.',
+      });
+    }
+
+    const dateOfBirth = new Date(dateOfBirthValue);
+
+    if (Number.isNaN(dateOfBirth.getTime())) {
+      return res.status(400).json({ error: 'dateOfBirth must be a valid date.' });
+    }
+
+    const targetClass = await prisma.class.findUnique({
+      where: { id: classId },
+      select: {
+        id: true,
+        name: true,
+        academicYear: true,
+      },
+    });
+
+    if (!targetClass) {
+      return res.status(404).json({ error: 'Class not found.' });
+    }
+
+    const internalEmail = 'student-' + randomBytes(16).toString('hex') + '@internal.school.local';
+    const internalPasswordHash = await bcrypt.hash(randomBytes(32).toString('hex'), 10);
+
+    const createdUser = await prisma.user.create({
+      data: {
+        email: internalEmail,
+        passwordHash: internalPasswordHash,
+        firstName,
+        lastName,
+        phone: phone || null,
+        role: Role.STUDENT,
+        isActive: true,
+        studentProfile: {
+          create: {
+            dateOfBirth,
+            class: {
+              connect: { id: classId },
+            },
+          },
+        },
+      },
+      include: {
+        studentProfile: {
+          include: {
+            class: true,
+            parent: {
+              include: {
+                user: {
+                  select: publicUserSelect,
+                },
+              },
+            },
+            parentLinks: {
+              include: {
+                parent: {
+                  include: {
+                    user: {
+                      select: publicUserSelect,
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    });
+
+    const createdStudent = createdUser.studentProfile;
+
+    if (!createdStudent) {
+      return res.status(500).json({ error: 'Failed to create student profile.' });
+    }
+
+    await createAuditLog(req, {
+      action: 'CREATE_STUDENT_RECORD',
+      entity: 'Student',
+      entityId: createdStudent.id,
+      details: {
+        studentName: firstName + ' ' + lastName,
+        classId: targetClass.id,
+        className: targetClass.name,
+        academicYear: targetClass.academicYear,
+      },
+    });
+
+    res.status(201).json({
+      ...createdStudent,
+      user: {
+        id: createdUser.id,
+        email: createdUser.email,
+        firstName: createdUser.firstName,
+        lastName: createdUser.lastName,
+        phone: createdUser.phone,
+        role: createdUser.role,
+        isActive: createdUser.isActive,
+        profileImage: createdUser.profileImage,
+      },
+    });
+  } catch (error) {
+    console.error('POST /api/students error:', error);
+    res.status(500).json({ error: 'Failed to create student record' });
+  }
+});
+
 app.get('/api/stats', authenticateToken, requireAdmin, async (req: Request, res: Response) => { try { res.json({ totalUsers: await prisma.user.count(), totalTeachers: await prisma.user.count({ where: { role: 'TEACHER' } }), totalStudents: await prisma.user.count({ where: { role: 'STUDENT' } }), totalAdmins: await prisma.user.count({ where: { role: 'ADMIN' } }) }); } catch (error) { res.status(500).json({ error: "Failed" }); } });
 app.get('/api/classes', authenticateToken, requireAdmin, async (req: Request, res: Response) => { try { res.json(await prisma.class.findMany({ include: { _count: { select: { students: true } } }, orderBy: { name: 'asc' } })); } catch (error) { res.status(500).json({ error: "Failed" }); } });
 app.post('/api/classes', authenticateToken, requireAdmin, async (req: Request, res: Response): Promise<any> => {
