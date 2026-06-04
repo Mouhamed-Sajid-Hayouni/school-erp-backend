@@ -650,7 +650,7 @@ app.post('/api/password-reset/request', async (req: Request, res: Response): Pro
     }
 
     res.json({
-      message: 'If this email belongs to an active admin, parent, or teacher account, a password reset request was submitted. Please contact school administration.',
+      message: 'If this email belongs to an active admin, parent, or teacher account, a password reset request was submitted. Please contact school administration or technical support.',
     });
   } catch (error) {
     console.error('POST /api/password-reset/request error:', error);
