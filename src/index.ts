@@ -4731,6 +4731,321 @@ app.put('/api/messages/conversations/:id/read', authenticateToken, async (req: R
   }
 });
 
+
+const childEnrollmentRequestInclude = {
+  parent: {
+    include: {
+      user: {
+        select: publicUserSelect,
+      },
+    },
+  },
+  reviewedBy: {
+    select: publicUserSelect,
+  },
+  approvedStudent: {
+    include: {
+      user: {
+        select: publicUserSelect,
+      },
+      class: true,
+    },
+  },
+};
+
+function normalizeChildEnrollmentStatus(value: unknown): string | undefined {
+  const normalized = String(value ?? '').trim().toUpperCase();
+
+  if (!normalized) return undefined;
+  if (['PENDING', 'APPROVED', 'REJECTED'].includes(normalized)) return normalized;
+
+  return undefined;
+}
+
+app.get('/api/my-child-enrollment-requests', authenticateToken, async (req: Request, res: Response): Promise<any> => {
+  try {
+    const userId = (req as any).user.userId;
+    const role = (req as any).user.role;
+
+    if (role !== Role.PARENT) {
+      return res.status(403).json({ error: 'Only parents can access child enrollment requests.' });
+    }
+
+    const parent = await prisma.parent.findUnique({
+      where: { userId },
+      select: { id: true },
+    });
+
+    if (!parent) {
+      return res.status(404).json({ error: 'Parent profile not found.' });
+    }
+
+    const requests = await prisma.childEnrollmentRequest.findMany({
+      where: { parentId: parent.id },
+      include: childEnrollmentRequestInclude,
+      orderBy: { createdAt: 'desc' },
+    });
+
+    res.json(requests);
+  } catch (error) {
+    console.error('GET /api/my-child-enrollment-requests error:', error);
+    res.status(500).json({ error: 'Failed to fetch child enrollment requests.' });
+  }
+});
+
+app.post('/api/child-enrollment-requests', authenticateToken, async (req: Request, res: Response): Promise<any> => {
+  try {
+    const userId = (req as any).user.userId;
+    const role = (req as any).user.role;
+
+    if (role !== Role.PARENT) {
+      return res.status(403).json({ error: 'Only parents can submit child enrollment requests.' });
+    }
+
+    const firstName = String(req.body.firstName ?? '').trim();
+    const lastName = String(req.body.lastName ?? '').trim();
+    const requestedLevel = String(req.body.requestedLevel ?? '').trim();
+    const note = String(req.body.note ?? '').trim();
+    const dateOfBirthValue = String(req.body.dateOfBirth ?? '').trim();
+
+    if (!firstName || !lastName || !dateOfBirthValue) {
+      return res.status(400).json({
+        error: 'firstName, lastName, and dateOfBirth are required.',
+      });
+    }
+
+    const dateOfBirth = new Date(dateOfBirthValue);
+
+    if (Number.isNaN(dateOfBirth.getTime())) {
+      return res.status(400).json({ error: 'dateOfBirth must be a valid date.' });
+    }
+
+    const parent = await prisma.parent.findUnique({
+      where: { userId },
+      include: {
+        user: {
+          select: publicUserSelect,
+        },
+      },
+    });
+
+    if (!parent) {
+      return res.status(404).json({ error: 'Parent profile not found.' });
+    }
+
+    const request = await prisma.childEnrollmentRequest.create({
+      data: {
+        parentId: parent.id,
+        firstName,
+        lastName,
+        dateOfBirth,
+        requestedLevel: requestedLevel || null,
+        note: note || null,
+        status: 'PENDING',
+      },
+      include: childEnrollmentRequestInclude,
+    });
+
+    await createAuditLog(req, {
+      action: 'REQUEST_CHILD_ENROLLMENT',
+      entity: 'ChildEnrollmentRequest',
+      entityId: request.id,
+      details: {
+        parentEmail: parent.user.email,
+        childName: [firstName, lastName].filter(Boolean).join(' '),
+        requestedLevel: requestedLevel || null,
+      },
+    });
+
+    res.status(201).json(request);
+  } catch (error) {
+    console.error('POST /api/child-enrollment-requests error:', error);
+    res.status(500).json({ error: 'Failed to submit child enrollment request.' });
+  }
+});
+
+app.get('/api/child-enrollment-requests', authenticateToken, requireAdmin, async (req: Request, res: Response): Promise<any> => {
+  try {
+    const status = normalizeChildEnrollmentStatus(req.query.status);
+
+    const requests = await prisma.childEnrollmentRequest.findMany({
+      where: status ? { status } : undefined,
+      include: childEnrollmentRequestInclude,
+      orderBy: { createdAt: 'desc' },
+    });
+
+    res.json(requests);
+  } catch (error) {
+    console.error('GET /api/child-enrollment-requests error:', error);
+    res.status(500).json({ error: 'Failed to fetch child enrollment requests.' });
+  }
+});
+
+app.post('/api/child-enrollment-requests/:id/approve', authenticateToken, requireAdmin, async (req: Request, res: Response): Promise<any> => {
+  try {
+    const requestId = String(req.params.id ?? '').trim();
+    const classId = String(req.body.classId ?? '').trim();
+    const adminNote = String(req.body.adminNote ?? '').trim();
+    const adminUserId = (req as any).user.userId;
+
+    if (!requestId) {
+      return res.status(400).json({ error: 'Request id is required.' });
+    }
+
+    if (!classId) {
+      return res.status(400).json({ error: 'classId is required to approve child enrollment.' });
+    }
+
+    const enrollmentRequest = await prisma.childEnrollmentRequest.findUnique({
+      where: { id: requestId },
+      include: {
+        parent: {
+          include: {
+            user: {
+              select: publicUserSelect,
+            },
+          },
+        },
+      },
+    });
+
+    if (!enrollmentRequest) {
+      return res.status(404).json({ error: 'Child enrollment request not found.' });
+    }
+
+    if (enrollmentRequest.status !== 'PENDING') {
+      return res.status(400).json({ error: 'Only pending child enrollment requests can be approved.' });
+    }
+
+    const targetClass = await prisma.class.findUnique({
+      where: { id: classId },
+    });
+
+    if (!targetClass) {
+      return res.status(404).json({ error: 'Class not found.' });
+    }
+
+    const internalEmail = 'child-' + randomBytes(16).toString('hex') + '@internal.school.local';
+    const internalPasswordHash = await bcrypt.hash(randomBytes(24).toString('hex'), 10);
+
+    const updatedRequest = await prisma.$transaction(async (tx) => {
+      const studentUser = await tx.user.create({
+        data: {
+          email: internalEmail,
+          passwordHash: internalPasswordHash,
+          firstName: enrollmentRequest.firstName,
+          lastName: enrollmentRequest.lastName,
+          role: Role.STUDENT,
+          isActive: true,
+        },
+      });
+
+      const student = await tx.student.create({
+        data: {
+          userId: studentUser.id,
+          dateOfBirth: enrollmentRequest.dateOfBirth,
+          classId,
+          parentId: enrollmentRequest.parentId,
+        },
+      });
+
+      await tx.parentStudent.create({
+        data: {
+          parentId: enrollmentRequest.parentId,
+          studentId: student.id,
+        },
+      });
+
+      return tx.childEnrollmentRequest.update({
+        where: { id: requestId },
+        data: {
+          status: 'APPROVED',
+          reviewedAt: new Date(),
+          reviewedById: adminUserId,
+          adminNote: adminNote || null,
+          approvedStudentId: student.id,
+        },
+        include: childEnrollmentRequestInclude,
+      });
+    });
+
+    await createAuditLog(req, {
+      action: 'APPROVE_CHILD_ENROLLMENT_REQUEST',
+      entity: 'ChildEnrollmentRequest',
+      entityId: requestId,
+      details: {
+        parentEmail: enrollmentRequest.parent.user.email,
+        childName: [enrollmentRequest.firstName, enrollmentRequest.lastName].filter(Boolean).join(' '),
+        classId,
+      },
+    });
+
+    res.json(updatedRequest);
+  } catch (error) {
+    console.error('POST /api/child-enrollment-requests/:id/approve error:', error);
+    res.status(500).json({ error: 'Failed to approve child enrollment request.' });
+  }
+});
+
+app.post('/api/child-enrollment-requests/:id/reject', authenticateToken, requireAdmin, async (req: Request, res: Response): Promise<any> => {
+  try {
+    const requestId = String(req.params.id ?? '').trim();
+    const adminNote = String(req.body.adminNote ?? '').trim();
+    const adminUserId = (req as any).user.userId;
+
+    if (!requestId) {
+      return res.status(400).json({ error: 'Request id is required.' });
+    }
+
+    const enrollmentRequest = await prisma.childEnrollmentRequest.findUnique({
+      where: { id: requestId },
+      include: {
+        parent: {
+          include: {
+            user: {
+              select: publicUserSelect,
+            },
+          },
+        },
+      },
+    });
+
+    if (!enrollmentRequest) {
+      return res.status(404).json({ error: 'Child enrollment request not found.' });
+    }
+
+    if (enrollmentRequest.status !== 'PENDING') {
+      return res.status(400).json({ error: 'Only pending child enrollment requests can be rejected.' });
+    }
+
+    const updatedRequest = await prisma.childEnrollmentRequest.update({
+      where: { id: requestId },
+      data: {
+        status: 'REJECTED',
+        reviewedAt: new Date(),
+        reviewedById: adminUserId,
+        adminNote: adminNote || null,
+      },
+      include: childEnrollmentRequestInclude,
+    });
+
+    await createAuditLog(req, {
+      action: 'REJECT_CHILD_ENROLLMENT_REQUEST',
+      entity: 'ChildEnrollmentRequest',
+      entityId: requestId,
+      details: {
+        parentEmail: enrollmentRequest.parent.user.email,
+        childName: [enrollmentRequest.firstName, enrollmentRequest.lastName].filter(Boolean).join(' '),
+      },
+    });
+
+    res.json(updatedRequest);
+  } catch (error) {
+    console.error('POST /api/child-enrollment-requests/:id/reject error:', error);
+    res.status(500).json({ error: 'Failed to reject child enrollment request.' });
+  }
+});
+
 // --- PARENT PORTAL ---
 app.get('/api/my-portal', authenticateToken, async (req: Request, res: Response): Promise<any> => {
   try {

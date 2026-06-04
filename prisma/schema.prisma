@@ -56,6 +56,7 @@ model User {
 
   conversationParticipants ConversationParticipant[]
   sentMessages             Message[]
+  reviewedChildEnrollmentRequests ChildEnrollmentRequest[] @relation("ChildEnrollmentRequestReviewer")
 }
 
 model Student {
@@ -73,6 +74,7 @@ model Student {
   attendances Attendance[]
   grades      Grade[]
   submissions AssignmentSubmission[]
+  approvedChildEnrollmentRequests ChildEnrollmentRequest[] @relation("ChildEnrollmentRequestApprovedStudent")
 }
 
 model Teacher {
@@ -95,6 +97,7 @@ model Parent {
 
   children     Student[]
   studentLinks ParentStudent[]
+  childEnrollmentRequests ChildEnrollmentRequest[]
 }
 
 model ParentStudent {
@@ -345,4 +348,29 @@ model AuditLog {
   @@index([entity])
   @@index([entityId])
   @@index([createdAt])
+}
+
+model ChildEnrollmentRequest {
+  id                String    @id @default(uuid())
+  parentId          String
+  parent            Parent    @relation(fields: [parentId], references: [id], onDelete: Cascade)
+  firstName         String
+  lastName          String
+  dateOfBirth       DateTime
+  requestedLevel    String?
+  note              String?
+  status            String    @default("PENDING")
+  reviewedAt        DateTime?
+  reviewedById      String?
+  reviewedBy        User?     @relation("ChildEnrollmentRequestReviewer", fields: [reviewedById], references: [id], onDelete: SetNull)
+  adminNote         String?
+  approvedStudentId String?
+  approvedStudent   Student?  @relation("ChildEnrollmentRequestApprovedStudent", fields: [approvedStudentId], references: [id], onDelete: SetNull)
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  @@index([parentId])
+  @@index([status])
+  @@index([reviewedById])
+  @@index([approvedStudentId])
 }
