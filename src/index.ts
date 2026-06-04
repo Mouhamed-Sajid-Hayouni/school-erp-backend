@@ -1175,6 +1175,50 @@ app.delete('/api/users/:id', authenticateToken, requireAdmin, async (_req: Reque
 });
 
 
+
+app.get('/api/parents', authenticateToken, requireAdmin, async (_req: Request, res: Response): Promise<any> => {
+  try {
+    const parents = await prisma.parent.findMany({
+      include: {
+        user: {
+          select: publicUserSelect,
+        },
+        children: {
+          include: {
+            user: {
+              select: publicUserSelect,
+            },
+            class: true,
+          },
+        },
+        studentLinks: {
+          include: {
+            student: {
+              include: {
+                user: {
+                  select: publicUserSelect,
+                },
+                class: true,
+              },
+            },
+          },
+        },
+      },
+    });
+
+    parents.sort((first, second) => {
+      const firstName = [first.user.firstName, first.user.lastName].filter(Boolean).join(' ');
+      const secondName = [second.user.firstName, second.user.lastName].filter(Boolean).join(' ');
+      return firstName.localeCompare(secondName, 'ar');
+    });
+
+    res.json(parents);
+  } catch (error) {
+    console.error('GET /api/parents error:', error);
+    res.status(500).json({ error: 'Failed to fetch parents' });
+  }
+});
+
 app.get('/api/students', authenticateToken, requireAdmin, async (_req: Request, res: Response): Promise<any> => {
   try {
     const students = await prisma.student.findMany({
@@ -1329,6 +1373,130 @@ app.post('/api/students', authenticateToken, requireAdmin, async (req: Request, 
   } catch (error) {
     console.error('POST /api/students error:', error);
     res.status(500).json({ error: 'Failed to create student record' });
+  }
+});
+
+
+app.put('/api/students/:studentId/parent', authenticateToken, requireAdmin, async (req: Request, res: Response): Promise<any> => {
+  try {
+    const studentId = String(req.params.studentId ?? '').trim();
+    const parentIdValue = req.body.parentId;
+    const parentId = parentIdValue === null || parentIdValue === undefined ? '' : String(parentIdValue).trim();
+
+    if (!studentId) {
+      return res.status(400).json({ error: 'studentId is required.' });
+    }
+
+    const student = await prisma.student.findUnique({
+      where: { id: studentId },
+      include: {
+        user: {
+          select: publicUserSelect,
+        },
+        class: true,
+      },
+    });
+
+    if (!student) {
+      return res.status(404).json({ error: 'Student not found.' });
+    }
+
+    if (!parentId) {
+      await prisma.$transaction([
+        prisma.parentStudent.deleteMany({ where: { studentId } }),
+        prisma.student.update({
+          where: { id: studentId },
+          data: { parentId: null },
+        }),
+      ]);
+
+      await createAuditLog(req, {
+        action: 'UNLINK_STUDENT_PARENT',
+        entity: 'Student',
+        entityId: studentId,
+        details: {
+          studentName: [student.user.firstName, student.user.lastName].filter(Boolean).join(' '),
+        },
+      });
+    } else {
+      const parent = await prisma.parent.findUnique({
+        where: { id: parentId },
+        include: {
+          user: {
+            select: {
+              ...publicUserSelect,
+              isActive: true,
+            },
+          },
+        },
+      });
+
+      if (!parent) {
+        return res.status(404).json({ error: 'Parent not found.' });
+      }
+
+      if (parent.user.role !== Role.PARENT || !parent.user.isActive) {
+        return res.status(400).json({ error: 'Parent account must be active.' });
+      }
+
+      await prisma.$transaction([
+        prisma.parentStudent.deleteMany({ where: { studentId } }),
+        prisma.student.update({
+          where: { id: studentId },
+          data: { parentId },
+        }),
+        prisma.parentStudent.create({
+          data: {
+            parentId,
+            studentId,
+          },
+        }),
+      ]);
+
+      await createAuditLog(req, {
+        action: 'LINK_STUDENT_PARENT',
+        entity: 'Student',
+        entityId: studentId,
+        details: {
+          studentName: [student.user.firstName, student.user.lastName].filter(Boolean).join(' '),
+          parentName: [parent.user.firstName, parent.user.lastName].filter(Boolean).join(' '),
+          parentId,
+        },
+      });
+    }
+
+    const updatedStudent = await prisma.student.findUnique({
+      where: { id: studentId },
+      include: {
+        user: {
+          select: publicUserSelect,
+        },
+        class: true,
+        parent: {
+          include: {
+            user: {
+              select: publicUserSelect,
+            },
+          },
+        },
+        parentLinks: {
+          include: {
+            parent: {
+              include: {
+                user: {
+                  select: publicUserSelect,
+                },
+              },
+            },
+          },
+        },
+      },
+    });
+
+    res.json(updatedStudent);
+  } catch (error) {
+    console.error('PUT /api/students/:studentId/parent error:', error);
+    res.status(500).json({ error: 'Failed to update student parent link' });
   }
 });
 
