@@ -8,6 +8,7 @@ import { PrismaPg } from '@prisma/adapter-pg';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { randomBytes } from 'crypto';
+import * as nodemailer from 'nodemailer';
 import 'dotenv/config';
 
 const connectionString = process.env.DATABASE_URL;
@@ -609,6 +610,78 @@ app.post('/api/login', async (req: Request, res: Response): Promise<any> => {
 });
 
 
+
+function escapeHtml(value: string): string {
+  return value.replace(/[&<>"']/g, (char) => {
+    const entities: Record<string, string> = {
+      '&': '&amp;',
+      '<': '&lt;',
+      '>': '&gt;',
+      '"': '&quot;',
+      "'": '&#039;',
+    };
+
+    return entities[char] ?? char;
+  });
+}
+
+async function sendPasswordResetEmail(params: {
+  to: string;
+  name: string;
+  resetLink: string;
+}): Promise<boolean> {
+  const smtpHost = process.env.SMTP_HOST;
+  const smtpUser = process.env.SMTP_USER;
+  const smtpPass = process.env.SMTP_PASS;
+  const smtpFrom = process.env.MAIL_FROM || smtpUser;
+
+  if (!smtpHost || !smtpUser || !smtpPass || !smtpFrom) {
+    return false;
+  }
+
+  try {
+    const transporter = nodemailer.createTransport({
+      host: smtpHost,
+      port: Number(process.env.SMTP_PORT || 587),
+      secure: String(process.env.SMTP_SECURE || 'false').toLowerCase() === 'true',
+      auth: {
+        user: smtpUser,
+        pass: smtpPass,
+      },
+    });
+
+    const safeName = escapeHtml(params.name || 'user');
+    const safeLink = escapeHtml(params.resetLink);
+
+    await transporter.sendMail({
+      from: smtpFrom,
+      to: params.to,
+      subject: 'School ERP password reset',
+      text: [
+        'Hello ' + (params.name || 'user') + ',',
+        '',
+        'Use this secure link to reset your School ERP password:',
+        params.resetLink,
+        '',
+        'This link expires in 15 minutes.',
+        'If you did not request this reset, you can ignore this email.',
+      ].join('\n'),
+      html: [
+        '<p>Hello ' + safeName + ',</p>',
+        '<p>Use this secure link to reset your School ERP password:</p>',
+        '<p><a href="' + safeLink + '">Reset password</a></p>',
+        '<p>This link expires in 15 minutes.</p>',
+        '<p>If you did not request this reset, you can ignore this email.</p>',
+      ].join(''),
+    });
+
+    return true;
+  } catch (error) {
+    console.error('[password-reset] Failed to send reset email:', error);
+    return false;
+  }
+}
+
 app.post('/api/password-reset/request', async (req: Request, res: Response): Promise<any> => {
   try {
     const normalizedEmail = String(req.body.email ?? '').trim().toLowerCase();
@@ -632,6 +705,7 @@ app.post('/api/password-reset/request', async (req: Request, res: Response): Pro
     });
 
     let demoResetLink: string | undefined;
+    let resetEmailSent = false;
 
     if (
       user &&
@@ -651,7 +725,15 @@ app.post('/api/password-reset/request', async (req: Request, res: Response): Pro
       const resetBaseUrl = (process.env.FRONTEND_URL || 'http://localhost:5173').replace(/\/$/, '');
       demoResetLink = resetBaseUrl + '/?resetToken=' + encodeURIComponent(resetToken);
 
-      console.log('[password-reset] Reset link for ' + user.email + ': ' + demoResetLink);
+      resetEmailSent = await sendPasswordResetEmail({
+        to: user.email,
+        name: [user.firstName, user.lastName].filter(Boolean).join(' '),
+        resetLink: demoResetLink,
+      });
+
+      if (!resetEmailSent) {
+        console.log('[password-reset] Reset link for ' + user.email + ': ' + demoResetLink);
+      }
 
       await createAuditLog(req, {
         action: 'REQUEST_PASSWORD_RESET',
