@@ -627,14 +627,32 @@ app.post('/api/password-reset/request', async (req: Request, res: Response): Pro
         lastName: true,
         role: true,
         isActive: true,
+        passwordHash: true,
       },
     });
+
+    let demoResetLink: string | undefined;
 
     if (
       user &&
       user.isActive &&
       ([Role.ADMIN, Role.PARENT, Role.TEACHER] as Role[]).includes(user.role)
     ) {
+      const resetToken = jwt.sign(
+        {
+          purpose: 'PASSWORD_RESET',
+          userId: user.id,
+          passwordHashFingerprint: user.passwordHash.slice(-24),
+        },
+        JWT_SECRET,
+        { expiresIn: '15m' }
+      );
+
+      const resetBaseUrl = (process.env.FRONTEND_URL || 'http://localhost:5173').replace(/\/$/, '');
+      demoResetLink = resetBaseUrl + '/?resetToken=' + encodeURIComponent(resetToken);
+
+      console.log('[password-reset] Reset link for ' + user.email + ': ' + demoResetLink);
+
       await createAuditLog(req, {
         action: 'REQUEST_PASSWORD_RESET',
         entity: 'User',
@@ -644,17 +662,109 @@ app.post('/api/password-reset/request', async (req: Request, res: Response): Pro
           firstName: user.firstName,
           lastName: user.lastName,
           role: user.role,
-          note: 'User requested password reset guidance.',
+          note: 'User requested a self-service password reset link.',
         },
       });
     }
 
     res.json({
-      message: 'If this email belongs to an active admin, parent, or teacher account, a password reset request was submitted. Please contact school administration or technical support.',
+      message: 'If this email belongs to an active admin, parent, or teacher account, a password reset link was generated. Check the configured email inbox or the local demo server logs.',
+      ...(process.env.NODE_ENV !== 'production' && demoResetLink ? { demoResetLink } : {}),
     });
   } catch (error) {
     console.error('POST /api/password-reset/request error:', error);
     res.status(500).json({ error: 'Failed to submit password reset request' });
+  }
+});
+
+app.post('/api/password-reset/confirm', async (req: Request, res: Response): Promise<any> => {
+  try {
+    const token = String(req.body.token ?? '').trim();
+    const newPassword = String(req.body.password ?? '');
+    const confirmPassword = String(req.body.confirmPassword ?? newPassword);
+
+    if (!token) {
+      return res.status(400).json({ error: 'Password reset token is required.' });
+    }
+
+    if (!newPassword || newPassword.length < 6) {
+      return res.status(400).json({ error: 'Password must be at least 6 characters long.' });
+    }
+
+    if (newPassword !== confirmPassword) {
+      return res.status(400).json({ error: 'Password confirmation does not match.' });
+    }
+
+    let payload: jwt.JwtPayload & {
+      purpose?: string;
+      userId?: string;
+      passwordHashFingerprint?: string;
+    };
+
+    try {
+      payload = jwt.verify(token, JWT_SECRET) as jwt.JwtPayload & {
+        purpose?: string;
+        userId?: string;
+        passwordHashFingerprint?: string;
+      };
+    } catch {
+      return res.status(400).json({ error: 'Password reset link is invalid or expired.' });
+    }
+
+    if (
+      payload.purpose !== 'PASSWORD_RESET' ||
+      !payload.userId ||
+      !payload.passwordHashFingerprint
+    ) {
+      return res.status(400).json({ error: 'Password reset link is invalid or expired.' });
+    }
+
+    const user = await prisma.user.findUnique({
+      where: { id: payload.userId },
+      select: {
+        id: true,
+        email: true,
+        firstName: true,
+        lastName: true,
+        role: true,
+        isActive: true,
+        passwordHash: true,
+      },
+    });
+
+    if (
+      !user ||
+      !user.isActive ||
+      !([Role.ADMIN, Role.PARENT, Role.TEACHER] as Role[]).includes(user.role) ||
+      user.passwordHash.slice(-24) !== payload.passwordHashFingerprint
+    ) {
+      return res.status(400).json({ error: 'Password reset link is invalid or expired.' });
+    }
+
+    const passwordHash = await bcrypt.hash(newPassword, 10);
+
+    await prisma.user.update({
+      where: { id: user.id },
+      data: { passwordHash },
+    });
+
+    await createAuditLog(req, {
+      action: 'CONFIRM_PASSWORD_RESET',
+      entity: 'User',
+      entityId: user.id,
+      details: {
+        email: user.email,
+        firstName: user.firstName,
+        lastName: user.lastName,
+        role: user.role,
+        note: 'User completed self-service password reset.',
+      },
+    });
+
+    res.json({ message: 'Password reset successfully. You can now log in with your new password.' });
+  } catch (error) {
+    console.error('POST /api/password-reset/confirm error:', error);
+    res.status(500).json({ error: 'Failed to reset password' });
   }
 });
 
