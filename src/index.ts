@@ -1716,6 +1716,51 @@ app.post('/api/subjects', authenticateToken, requireAdmin, async (req: Request, 
     res.status(500).json({ error: 'Failed' });
   }
 });
+app.put('/api/subjects/:id', authenticateToken, requireAdmin, async (req: Request, res: Response): Promise<any> => {
+  try {
+    const subjectId = String(req.params.id ?? '').trim();
+    const name = String(req.body.name ?? '').trim();
+    const coefficient = Number(req.body.coefficient);
+
+    if (!name || Number.isNaN(coefficient) || coefficient <= 0) {
+      return res.status(400).json({ error: 'Subject name and a positive coefficient are required.' });
+    }
+
+    const existingSubject = await prisma.subject.findUnique({
+      where: { id: subjectId },
+    });
+
+    if (!existingSubject) {
+      return res.status(404).json({ error: 'Subject not found.' });
+    }
+
+    const updatedSubject = await prisma.subject.update({
+      where: { id: subjectId },
+      data: {
+        name,
+        coefficient,
+      },
+    });
+
+    await createAuditLog(req, {
+      action: 'UPDATE_SUBJECT',
+      entity: 'Subject',
+      entityId: subjectId,
+      details: {
+        previousName: existingSubject.name,
+        previousCoefficient: existingSubject.coefficient,
+        name,
+        coefficient,
+      },
+    });
+
+    res.json(updatedSubject);
+  } catch (error) {
+    console.error('PUT /api/subjects/:id error:', error);
+    res.status(500).json({ error: 'Failed to update subject' });
+  }
+});
+
 app.delete('/api/subjects/:id', authenticateToken, requireAdmin, async (req: Request, res: Response): Promise<any> => {
   try {
     const subjectId = req.params.id as string;
