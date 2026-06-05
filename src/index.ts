@@ -2401,10 +2401,15 @@ app.get('/api/my-schedule-students/:scheduleId', authenticateToken, async (req: 
       return res.status(403).json({ error: 'Only teachers can access this resource.' });
     }
 
+    const userId = String(user.userId ?? user.id ?? '').trim();
     const scheduleId = String(req.params.scheduleId ?? '').trim();
 
+    if (!userId || !scheduleId) {
+      return res.status(400).json({ error: 'Teacher user and schedule are required.' });
+    }
+
     const teacher = await prisma.teacher.findUnique({
-      where: { userId: user.id },
+      where: { userId },
     });
 
     if (!teacher) {
