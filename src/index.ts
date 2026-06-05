@@ -1569,6 +1569,58 @@ app.get('/api/classes/:id', authenticateToken, requireAdmin, async (req: Request
     res.status(500).json({ error: "Failed" });
   }
 });
+app.put('/api/classes/:id', authenticateToken, requireAdmin, async (req: Request, res: Response): Promise<any> => {
+  try {
+    const classId = String(req.params.id ?? '').trim();
+    const name = String(req.body.name ?? '').trim();
+    const academicYear = String(req.body.academicYear ?? '').trim();
+
+    if (!name || !academicYear) {
+      return res.status(400).json({ error: 'Class name and academic year are required.' });
+    }
+
+    const existingClass = await prisma.class.findUnique({
+      where: { id: classId },
+    });
+
+    if (!existingClass) {
+      return res.status(404).json({ error: 'Class not found.' });
+    }
+
+    const updatedClass = await prisma.class.update({
+      where: { id: classId },
+      data: {
+        name,
+        academicYear,
+      },
+      include: {
+        _count: {
+          select: {
+            students: true,
+          },
+        },
+      },
+    });
+
+    await createAuditLog(req, {
+      action: 'UPDATE_CLASS',
+      entity: 'Class',
+      entityId: classId,
+      details: {
+        previousName: existingClass.name,
+        previousAcademicYear: existingClass.academicYear,
+        name,
+        academicYear,
+      },
+    });
+
+    res.json(updatedClass);
+  } catch (error) {
+    console.error('PUT /api/classes/:id error:', error);
+    res.status(500).json({ error: 'Failed to update class' });
+  }
+});
+
 app.delete('/api/classes/:id', authenticateToken, requireAdmin, async (req: Request, res: Response): Promise<any> => {
   try {
     const classId = req.params.id as string;
