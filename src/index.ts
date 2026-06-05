@@ -2393,6 +2393,68 @@ app.delete('/api/schedules/:id', authenticateToken, requireAdmin, async (req: Re
     res.status(500).json({ error: "Failed" });
   }
 });
+app.get('/api/my-schedule-students/:scheduleId', authenticateToken, async (req: Request, res: Response): Promise<any> => {
+  try {
+    const user = (req as any).user;
+
+    if (user.role !== Role.TEACHER) {
+      return res.status(403).json({ error: 'Only teachers can access this resource.' });
+    }
+
+    const scheduleId = String(req.params.scheduleId ?? '').trim();
+
+    const teacher = await prisma.teacher.findUnique({
+      where: { userId: user.id },
+    });
+
+    if (!teacher) {
+      return res.status(404).json({ error: 'Teacher profile not found.' });
+    }
+
+    const schedule = await prisma.schedule.findFirst({
+      where: {
+        id: scheduleId,
+        teacherId: teacher.id,
+      },
+      include: {
+        class: {
+          include: {
+            students: {
+              include: {
+                user: {
+                  select: {
+                    firstName: true,
+                    lastName: true,
+                    email: true,
+                  },
+                },
+              },
+              orderBy: {
+                user: {
+                  firstName: 'asc',
+                },
+              },
+            },
+          },
+        },
+      },
+    });
+
+    if (!schedule || !schedule.class) {
+      return res.status(404).json({ error: 'Schedule not found for this teacher.' });
+    }
+
+    res.json({
+      id: schedule.class.id,
+      name: schedule.class.name,
+      students: schedule.class.students,
+    });
+  } catch (error) {
+    console.error('GET /api/my-schedule-students/:scheduleId error:', error);
+    res.status(500).json({ error: 'Failed to load class students' });
+  }
+});
+
 app.get('/api/attendance/:scheduleId', authenticateToken, async (req: Request, res: Response): Promise<any> => {
   try {
     const userId = (req as any).user.userId;
