@@ -732,7 +732,11 @@ app.post('/api/password-reset/request', async (req: Request, res: Response): Pro
       });
 
       if (!resetEmailSent) {
-        console.log('[password-reset] Reset link for ' + user.email + ': ' + demoResetLink);
+        if (process.env.NODE_ENV === 'production') {
+          console.warn('[password-reset] Email delivery failed; reset link was not logged.');
+        } else {
+          console.log('[password-reset] Reset link for ' + user.email + ': ' + demoResetLink);
+        }
       }
 
       await createAuditLog(req, {
